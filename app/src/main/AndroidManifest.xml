@@ -3,6 +3,11 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Local network access: while targetSdk is 36 it comes with INTERNET. ACCESS_LOCAL_NETWORK must NOT be
+         declared before targeting 37 (Google's guidance); when moving to 37, add it here. The app already asks for
+         it then, with an explanation first (LocalNetworkScreen in Ui.kt, LocalNetwork in SyncPolicy.kt). -->
+    <!-- To find the laptop at the Wi-Fi gateway address (Discovery) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
@@ -11,6 +16,9 @@
         tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.health.READ_SLEEP" />
+    <!-- Only to scan the laptop's pairing QR code; asked for when you tap "Pair with laptop" -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <queries>
         <package android:name="com.google.android.apps.healthdata" />
@@ -36,6 +44,12 @@
                 <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
             </intent-filter>
         </activity>
+
+        <!-- The QR scanner (ZXing): follow the phone's orientation instead of the library's landscape -->
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:screenOrientation="fullSensor"
+            tools:replace="screenOrientation" />
 
         <activity-alias
             android:name="ViewPermissionUsageActivity"

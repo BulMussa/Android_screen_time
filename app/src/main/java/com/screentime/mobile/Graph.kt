@@ -8,7 +8,8 @@ import java.util.UUID
 
 /** The app's shared storage, created once in [ScreenTimeApp]. */
 object Graph {
-    private lateinit var appContext: Context
+    lateinit var appContext: Context
+        private set
     val prefs: Prefs by lazy { Prefs(appContext) }
     val db: Db by lazy { Db(appContext) }
 

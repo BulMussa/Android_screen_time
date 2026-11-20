@@ -18,37 +18,20 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.LocalDateTime
-import java.time.LocalTime
-import java.time.format.DateTimeFormatter
 import java.util.concurrent.TimeUnit
 
 /** Everything that runs in the background: read the phone, sync, remind. */
 object Pipeline {
     /** Returns the status text, which is also kept for the screens. */
-    suspend fun run(context: Context): String = withContext(Dispatchers.IO) {
+    suspend fun run(context: Context, trigger: Trigger): String = withContext(Dispatchers.IO) {
         runCatching { UsageCollector.scan(context) }
         if (Graph.prefs.sleepMethod == "band") runCatching { SleepCollector.scan(context) }
-        val status = if (!SyncEngine.usesServer(Graph.prefs.syncMode)) {
-            SyncEngine.DIRECT_NOT_READY // the only other transport, direct, isn't built yet
-        } else if (!Graph.prefs.connected) {
-            "Not connected"
-        } else {
-            try {
-                val rejected = SyncEngine.run()
-                "Synced at ${LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))}" +
-                    if (rejected > 0) ", $rejected rows rejected (is the phone's clock right?)" else ""
-            } catch (e: SyncException) {
-                when {
-                    e.status == 401 -> "The server doesn't accept this phone anymore. Disconnect and connect again."
-                    e.status == null || e.status >= 500 -> "Offline, will try again. ${e.message}"
-                    else -> "The server refused the data: ${e.message}"
-                }
-            }
-        }
+        val status = SyncStatus.text(SyncEngine.run(trigger), previous = Graph.prefs.status)
         Graph.prefs.status = status
         Reminders.check(context)
         status
@@ -56,8 +39,14 @@ object Pipeline {
 }
 
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    companion object {
+        const val TRIGGER = "trigger"
+    }
+
     override suspend fun doWork(): Result {
-        Pipeline.run(applicationContext)
+        // The 15-minute job is BACKGROUND; Scheduler.syncNow says MANUAL
+        val trigger = runCatching { Trigger.valueOf(inputData.getString(TRIGGER) ?: "") }.getOrDefault(Trigger.BACKGROUND)
+        Pipeline.run(applicationContext, trigger)
         return Result.success()
     }
 }
@@ -71,7 +60,10 @@ object Scheduler {
 
     fun syncNow(context: Context) {
         WorkManager.getInstance(context)
-            .enqueueUniqueWork("sync-now", ExistingWorkPolicy.REPLACE, OneTimeWorkRequestBuilder<SyncWorker>().build())
+            .enqueueUniqueWork(
+                "sync-now", ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<SyncWorker>().setInputData(workDataOf(SyncWorker.TRIGGER to Trigger.MANUAL.name)).build(),
+            )
     }
 }
 

@@ -15,6 +15,9 @@ data class Rejected(val intervals: List<Interval>, val usage: List<Usage>) {
 /** Intervals changed since a cursor, the cursor to ask with next time, and whether more are waiting. */
 class Page(val intervals: List<Interval>, val cursor: String, val hasMore: Boolean)
 
+/** A transport that isn't set up: no server connected, or no laptop paired. The message says which. */
+class NotSetUpException(message: String) : SyncException(message)
+
 /** The other side doesn't know the pull cursor (e.g. the server was restored from an older backup). */
 class CursorUnknownException(message: String) : SyncException(message, 400)
 
@@ -31,6 +34,9 @@ interface Transport {
 
     /** Intervals changed since [cursor] ("0" = from the start); throws [CursorUnknownException] or [SyncException]. */
     fun fetch(cursor: String, limit: Int): Page
+
+    /** A word for the sync status after a sync, e.g. how the other side was found; null for none. */
+    val note: String? get() = null
 }
 
 /** Your own Screen Time server: POST /v1/sync/push and GET /v1/sync/pull. */
@@ -38,19 +44,8 @@ class ServerTransport(private val server: String, private val token: String) : T
     override val name = "server"
 
     override fun send(intervals: List<Interval>, usage: List<Usage>): Rejected {
-        val body = JSONObject()
-            .put("intervals", JSONArray().also { a -> intervals.forEach { a.put(Rows.intervalJson(it)) } })
-            .put("app_usage_daily", JSONArray().also { a -> usage.forEach { a.put(Rows.usageJson(it)) } })
-        val result = Api.call(server, "POST", "/v1/sync/push", body, token)
-        return parsed {
-            val badIntervals = rejectedIds(result.getJSONObject("intervals"))
-            // The server names an app usage row as "<date>|<app>|<monitor>"; phones have no monitor.
-            val badUsage = rejectedIds(result.getJSONObject("app_usage_daily"))
-            Rejected(
-                intervals.filter { it.id in badIntervals },
-                usage.filter { "${it.day}|${it.app.take(255)}|" in badUsage },
-            )
-        }
+        val result = Api.call(server, "POST", "/v1/sync/push", Rows.pushBody(intervals, usage), token)
+        return parsed { Rows.rejected(result, intervals, usage) }
     }
 
     override fun fetch(cursor: String, limit: Int): Page {
@@ -71,11 +66,6 @@ class ServerTransport(private val server: String, private val token: String) : T
         }
     }
 
-    private fun rejectedIds(part: JSONObject): Set<String> {
-        val list = part.getJSONArray("rejected")
-        return (0 until list.length()).map { list.getJSONObject(it).getString("id") }.toSet()
-    }
-
     private inline fun <T> parsed(block: () -> T): T = try {
         block()
     } catch (e: JSONException) {
@@ -87,6 +77,23 @@ class ServerTransport(private val server: String, private val token: String) : T
 
 /** Rows as JSON, in the server's format; backups use the same format. */
 object Rows {
+    /** The body of a push, the same for the server and the laptop. */
+    fun pushBody(intervals: List<Interval>, usage: List<Usage>): JSONObject = JSONObject()
+        .put("intervals", JSONArray().also { a -> intervals.forEach { a.put(intervalJson(it)) } })
+        .put("app_usage_daily", JSONArray().also { a -> usage.forEach { a.put(usageJson(it)) } })
+
+    /** The rows a push answer names as rejected; throws JSONException. */
+    fun rejected(result: JSONObject, intervals: List<Interval>, usage: List<Usage>): Rejected {
+        fun ids(part: JSONObject): Set<String> {
+            val list = part.getJSONArray("rejected")
+            return (0 until list.length()).map { list.getJSONObject(it).getString("id") }.toSet()
+        }
+        val badIntervals = ids(result.getJSONObject("intervals"))
+        // An app usage row is named "<date>|<app>|<monitor>"; phones have no monitor.
+        val badUsage = ids(result.getJSONObject("app_usage_daily"))
+        return Rejected(intervals.filter { it.id in badIntervals }, usage.filter { "${it.day}|${it.app.take(255)}|" in badUsage })
+    }
+
     fun intervalJson(i: Interval): JSONObject = JSONObject()
         .put("id", i.id)
         .put("kind", i.kind)

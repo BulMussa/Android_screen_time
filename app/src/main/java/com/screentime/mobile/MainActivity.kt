@@ -26,6 +26,6 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         // Read the phone and sync whenever the app is opened; Health Connect only answers a visible app.
-        lifecycleScope.launch { Pipeline.run(applicationContext) }
+        lifecycleScope.launch { Pipeline.run(applicationContext, Trigger.OPEN) }
     }
 }

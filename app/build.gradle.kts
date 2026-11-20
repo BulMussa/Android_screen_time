@@ -13,6 +13,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -41,4 +42,12 @@ dependencies {
     implementation(libs.androidx.work)
     implementation(libs.androidx.health.connect)
     implementation(libs.androidx.security.crypto)
+    implementation(libs.zxing.android.embedded)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.org.json)
+
+    // DiscoveryLiveTest: runs on a phone against the real laptop, only when given its address
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.junit)
 }
