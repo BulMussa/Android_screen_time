@@ -102,7 +102,7 @@ object UsageCollector {
             if (s[1] - s[0] < MIN_SPAN) continue
             val id = stableId(install, "phone_active", s[0])
             keep.add(id)
-            db.saveLocal(Interval(id, "phone_active", s[0], s[1], "tracker", 0, true, false, false))
+            db.saveLocal(Interval(id, "phone_active", s[0], s[1], "tracker", 0, true, false))
         }
         // Periods that merged into a neighbour, or no longer exist, are removed (and the removal is sent).
         for (old in db.mineStarting("phone_active", fromSec, nowSec + 1)) {
@@ -153,7 +153,7 @@ object SleepCollector {
             val start = r.startTime.epochSecond
             val stop = r.endTime.epochSecond
             if (stop <= start) continue
-            Graph.db.saveLocal(Interval(stableId(install, "sleep", start), "sleep", start, stop, "health_connect", 0, true, false, false))
+            Graph.db.saveLocal(Interval(stableId(install, "sleep", start), "sleep", start, stop, "health_connect", 0, true, false))
             seen++
         }
         return seen

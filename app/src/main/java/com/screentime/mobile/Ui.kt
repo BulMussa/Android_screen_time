@@ -10,6 +10,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -35,30 +37,43 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.health.connect.client.PermissionController
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private enum class Screen { SETUP, HOME, SLEEP, SETTINGS }
 
@@ -237,45 +252,81 @@ private fun TimelineView(rows: List<TimelineRow>, showNow: Boolean, onInfo: (Str
     val track = MaterialTheme.colorScheme.surfaceVariant
     val gap = MaterialTheme.colorScheme.surface
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Column {
-        rows.forEach { row ->
+    val nowColor = if (isSystemInDarkTheme()) COLOR_NOW_DARK else COLOR_NOW
+    val nowText = MaterialTheme.colorScheme.onSurface
+    val nowStyle = MaterialTheme.typography.bodyMedium // the now-line's time, a bit bigger than the hours
+    val measurer = rememberTextMeasurer()
+    var origin by remember { mutableStateOf(Offset.Zero) }
+    val bars = remember { mutableStateMapOf<Int, Rect>() } // each row's bar, in root coordinates
+
+    Column(
+        Modifier
+            .onGloballyPositioned { origin = it.positionInRoot() }
+            .drawWithContent {
+                drawContent()
+                if (!showNow || bars.isEmpty()) return@drawWithContent
+                // One line across all three rows, from just above the first bar to just below the last
+                val first = bars.values.minBy { it.top }
+                val last = bars.values.maxBy { it.bottom }
+                val now = LocalTime.now()
+                val x = first.left - origin.x + first.width * now.toSecondOfDay() / 86_400f
+                val w = 3.dp.toPx()
+                val y1 = first.top - origin.y - 3.dp.toPx()
+                val y2 = last.bottom - origin.y + 3.dp.toPx()
+                // Round caps reach half the width past each end, so the ends are moved in by that much.
+                drawLine(nowColor, Offset(x, y1 + w / 2), Offset(x, y2 - w / 2), strokeWidth = w, cap = StrokeCap.Round)
+                // The time on top of the line, centered on it but kept inside the view near the edges
+                val label = measurer.measure(now.format(DateTimeFormatter.ofPattern("HH:mm")), nowStyle)
+                val half = label.size.width / 2f
+                val xl = minOf(maxOf(x, half + 1), size.width - half - 1)
+                drawText(label, color = nowText, topLeft = Offset(xl - half, y1 - label.size.height))
+            },
+    ) {
+        Spacer(Modifier.height(22.dp)) // room on top for the now-line's time
+        rows.forEachIndexed { index, row ->
             Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.width(78.dp)) {
                     Text(row.name, style = MaterialTheme.typography.labelLarge)
                     Text(row.summary, style = MaterialTheme.typography.bodySmall, color = muted)
                 }
                 Canvas(
-                    Modifier.weight(1f).height(28.dp).pointerInput(row) {
-                        detectTapGestures { pos ->
-                            val second = (pos.x / size.width * 86_400).toLong()
-                            val slack = (4.dp.toPx() / size.width * 86_400).toLong()
-                            val hit = row.parts.reversed().firstNotNullOfOrNull { part ->
-                                part.spans.firstOrNull { second >= it.start - slack && second <= it.end + slack }
-                                    ?.let { part to it }
+                    Modifier
+                        .weight(1f)
+                        .height(28.dp)
+                        .onGloballyPositioned { bars[index] = it.boundsInRoot() }
+                        .pointerInput(row) {
+                            detectTapGestures { pos ->
+                                val second = (pos.x / size.width * 86_400).toLong()
+                                val slack = (4.dp.toPx() / size.width * 86_400).toLong()
+                                val hit = row.parts.reversed().firstNotNullOfOrNull { part ->
+                                    part.spans.firstOrNull { second >= it.start - slack && second <= it.end + slack }
+                                        ?.let { part to it }
+                                }
+                                onInfo(
+                                    if (hit == null) "" else
+                                        "${hit.first.title}   ${hm(hit.second.start)} – ${hm(hit.second.end)}   " +
+                                            "(${short(hit.second.end - hit.second.start)})",
+                                )
                             }
-                            onInfo(
-                                if (hit == null) "" else
-                                    "${hit.first.title}   ${hm(hit.second.start)} – ${hm(hit.second.end)}   " +
-                                        "(${short(hit.second.end - hit.second.start)})",
-                            )
-                        }
-                    },
+                        },
                 ) {
-                    drawRect(track, size = size)
-                    for (h in 1..23) {
-                        val x = size.width * h / 24f
-                        drawLine(gap, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1.dp.toPx())
+                    // A bar with fully round ends: the periods are cut to its shape, square in the middle.
+                    val pill = Path().apply {
+                        addRoundRect(RoundRect(0f, 0f, size.width, size.height, CornerRadius(size.height / 2)))
                     }
-                    row.parts.forEach { part ->
-                        part.spans.forEach { s ->
-                            val x1 = size.width * s.start / 86_400f
-                            val x2 = size.width * s.end / 86_400f
-                            drawRect(part.color, Offset(x1, 0f), Size(maxOf(x2 - x1, 1.dp.toPx()), size.height))
+                    clipPath(pill) {
+                        drawRect(track, size = size)
+                        for (h in 1..23) { // thin gaps divide the gray bar into hours; the colored spans cover them
+                            val x = size.width * h / 24f
+                            drawLine(gap, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1.dp.toPx())
                         }
-                    }
-                    if (showNow) {
-                        val x = size.width * LocalTime.now().toSecondOfDay() / 86_400f
-                        drawLine(Color(0xFFDC2626), Offset(x, 0f), Offset(x, size.height), strokeWidth = 2.dp.toPx())
+                        row.parts.forEach { part ->
+                            part.spans.forEach { s ->
+                                val x1 = size.width * s.start / 86_400f
+                                val x2 = size.width * s.end / 86_400f
+                                drawRect(part.color, Offset(x1, 0f), Size(maxOf(x2 - x1, 1.dp.toPx()), size.height))
+                            }
+                        }
                     }
                 }
             }
@@ -335,7 +386,7 @@ private fun SleepScreen(modifier: Modifier, tick: Int, onBack: () -> Unit) {
                 error = "That is in the future."
             } else {
                 error = ""
-                Graph.db.saveLocal(Interval(UUID.randomUUID().toString(), "sleep", bedAt, wakeAt, "manual", 0, true, false, false))
+                Graph.db.saveLocal(Interval(UUID.randomUUID().toString(), "sleep", bedAt, wakeAt, "manual", 0, true, false))
                 Scheduler.syncNow(context)
                 reload++
             }
@@ -391,6 +442,44 @@ private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, on
         }
     }
     val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { reload++ }
+    val mode = remember(reload) { prefs.syncMode }
+    var backupMessage by remember { mutableStateOf("") }
+    var backupBusy by remember { mutableStateOf(false) }
+
+    fun backupTask(work: () -> String) {
+        backupBusy = true
+        backupMessage = ""
+        scope.launch {
+            backupMessage = withContext(Dispatchers.IO) { work() }
+            backupBusy = false
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) backupTask {
+            try {
+                val stream = context.contentResolver.openOutputStream(uri, "wt") ?: throw java.io.IOException("can't open the file")
+                val (own, others) = stream.use { Backup.export(it) }
+                "Backup saved: $own rows of this phone, $others from other devices."
+            } catch (e: Exception) {
+                "Couldn't save the backup: ${e.message}"
+            }
+        }
+    }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) backupTask {
+            try {
+                val stream = context.contentResolver.openInputStream(uri) ?: throw BackupException("Couldn't open the file.")
+                val result = stream.use { Backup.import(it) }
+                Scheduler.syncNow(context)
+                "Backup imported: ${result.stored} periods and ${result.usage} app times were newer and merged in" +
+                    " (${result.read} rows read)." +
+                    if (result.skipped > 0) " ${result.skipped} app times of another device were left out." else ""
+            } catch (e: Exception) { // BackupException, or the file can't be read
+                "Couldn't import: ${e.message}"
+            }
+        }
+    }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -407,6 +496,44 @@ private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, on
             Text("Not connected. Phone use is still recorded on this phone.")
             Button(onClick = onDisconnected) { Text("Connect") }
         }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Sync with", style = MaterialTheme.typography.titleSmall)
+        listOf("server" to "Server", "direct" to "PC directly", "both" to "Both").forEach { (value, label) ->
+            Row(
+                Modifier.fillMaxWidth().selectable(selected = mode == value, role = Role.RadioButton, onClick = {
+                    prefs.syncMode = value
+                    reload++
+                    Scheduler.syncNow(context)
+                }),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = mode == value, onClick = null) // the whole row is the button
+                Text(label)
+            }
+        }
+        if (!SyncEngine.usesServer(mode) || mode == "both") {
+            Text(
+                "Syncing directly with the PC isn't built yet, so " +
+                    if (mode == "both") "Both works like Server for now." else "this phone syncs nothing for now.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Backup", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "A JSON file with everything on this phone. Importing merges a backup in (also one from the Windows app); " +
+                "for each period the newer copy wins.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(enabled = !backupBusy, onClick = { exportLauncher.launch(Backup.fileName()) }) { Text("Export backup") }
+            OutlinedButton(enabled = !backupBusy, onClick = {
+                importLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/*"))
+            }) { Text("Import backup") }
+        }
+        if (backupMessage.isNotEmpty()) Text(backupMessage, style = MaterialTheme.typography.bodySmall)
 
         Spacer(Modifier.height(8.dp))
         Text("Phone use", style = MaterialTheme.typography.titleSmall)

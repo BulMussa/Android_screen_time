@@ -8,7 +8,7 @@ import java.net.URI
 import java.net.URL
 
 /** [status] is the HTTP status, or null if the server couldn't be reached. */
-class SyncException(message: String, val status: Int? = null, val retryAfter: Int? = null) : Exception(message)
+open class SyncException(message: String, val status: Int? = null, val retryAfter: Int? = null) : Exception(message)
 
 /** The server's REST API (see the server's "API contract for clients"). */
 object Api {
@@ -88,27 +88,30 @@ object Api {
                 JSONObject().put("name", deviceName.trim()).put("type", "android"),
                 login.getString("session_token"),
             )
-            val prefs = Graph.prefs
-            prefs.token = device.getString("token")
-            prefs.server = server
-            prefs.deviceId = device.getInt("device_id")
-            prefs.deviceName = device.getString("name")
-            prefs.cursor = "0"
-            Graph.db.deleteRemote()
-            Graph.db.markAllDirty() // send the history already on the phone
+            val token = device.getString("token")
+            val deviceId = device.getInt("device_id")
+            val registeredName = device.getString("name")
+            synchronized(SyncEngine.lock) {
+                val prefs = Graph.prefs
+                prefs.token = token
+                prefs.server = server
+                prefs.deviceId = deviceId
+                prefs.deviceName = registeredName
+                SyncEngine.resetRemote()
+                Graph.db.forgetSent("server") // send the history already on the phone
+            }
         } catch (e: JSONException) {
             throw SyncException("Unexpected answer from the server")
         }
     }
 
     /** Forgets the server and token. The phone stays registered on the server. */
-    fun disconnect() {
+    fun disconnect() = synchronized(SyncEngine.lock) {
         val prefs = Graph.prefs
         prefs.token = null
         prefs.server = null
         prefs.deviceId = -1
         prefs.deviceName = null
-        prefs.cursor = "0"
-        Graph.db.deleteRemote()
+        SyncEngine.resetRemote()
     }
 }

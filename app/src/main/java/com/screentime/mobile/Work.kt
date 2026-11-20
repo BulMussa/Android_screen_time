@@ -32,7 +32,9 @@ object Pipeline {
     suspend fun run(context: Context): String = withContext(Dispatchers.IO) {
         runCatching { UsageCollector.scan(context) }
         if (Graph.prefs.sleepMethod == "band") runCatching { SleepCollector.scan(context) }
-        val status = if (!Graph.prefs.connected) {
+        val status = if (!SyncEngine.usesServer(Graph.prefs.syncMode)) {
+            SyncEngine.DIRECT_NOT_READY // the only other transport, direct, isn't built yet
+        } else if (!Graph.prefs.connected) {
             "Not connected"
         } else {
             try {

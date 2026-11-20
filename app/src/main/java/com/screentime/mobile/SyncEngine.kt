@@ -1,117 +1,90 @@
 package com.screentime.mobile
 
-import org.json.JSONArray
-import org.json.JSONException
-import org.json.JSONObject
-import java.net.URLEncoder
-import java.time.DateTimeException
-import java.time.Instant
-
-/** Sends what changed on this phone and fetches what other devices sent. */
+/**
+ * Sends what changed on this phone and fetches what other devices sent, over each transport the
+ * sync mode uses. Today the only working transport is your own server; "direct" (this phone talking
+ * to the PC on your own network) is a placeholder, like in the Windows app.
+ */
 object SyncEngine {
     private const val BATCH = 1000
-    private val lock = Any()
 
-    /** Returns how many rows the server rejected; throws [SyncException]. */
+    const val DEFAULT_MODE = "server"
+    val TRANSPORTS = listOf("server", "direct")
+    /** Sync mode -> the transports it uses. */
+    val MODES = mapOf("server" to listOf("server"), "direct" to listOf("direct"), "both" to listOf("server", "direct"))
+    const val DIRECT_NOT_READY = "Direct sync isn't available yet. Choose Server or Both to sync."
+
+    /** One sync, connect, disconnect or backup import at a time. */
+    val lock = Any()
+
+    fun usesServer(mode: String): Boolean = "server" in MODES[mode].orEmpty()
+
+    /** The transport called [name], ready to use; throws [SyncException] if it can't be used now. */
+    fun transportFor(name: String): Transport = when (name) {
+        "server" -> {
+            val server = Graph.prefs.server
+            val token = Graph.prefs.token
+            if (server == null || token == null) throw SyncException("Not connected")
+            ServerTransport(server, token)
+        }
+        "direct" -> throw SyncException(DIRECT_NOT_READY) // the phone will talk to the PC directly; not built yet
+        else -> throw IllegalArgumentException("unknown transport $name")
+    }
+
+    /** Syncs over every transport of the sync mode. Returns how many rows were rejected; throws [SyncException]. */
     fun run(): Int = synchronized(lock) {
-        val server = Graph.prefs.server
-        val token = Graph.prefs.token
-        if (server == null || token == null) throw SyncException("Not connected")
-        try {
-            val rejected = push(server, token)
-            pull(server, token)
+        // Direct isn't built yet, so "both" works like "server" for now.
+        val names = MODES.getValue(Graph.prefs.syncMode).filter { it != "direct" }
+        if (names.isEmpty()) throw SyncException(DIRECT_NOT_READY)
+        names.sumOf { name ->
+            val transport = transportFor(name)
+            val rejected = push(transport)
+            pull(transport)
             rejected
-        } catch (e: JSONException) {
-            throw SyncException("Unexpected answer from the server")
-        } catch (e: DateTimeException) {
-            throw SyncException("Unexpected answer from the server")
         }
     }
 
-    private fun intervalJson(i: Interval): JSONObject = JSONObject()
-        .put("id", i.id)
-        .put("kind", i.kind)
-        .put("start_utc", isoUtc(i.start))
-        .put("end_utc", isoUtc(i.end))
-        .put("source", i.source)
-        .put("updated_at", isoUtcMs(i.updatedMs))
-        .put("deleted_at", if (i.deleted) isoUtcMs(i.updatedMs) else JSONObject.NULL)
-
-    private fun usageJson(u: Usage): JSONObject {
-        val seconds = minOf(u.seconds, 90_000L)
-        return JSONObject()
-            .put("local_date", u.day)
-            .put("app", u.app.take(255))
-            .put("monitor", JSONObject.NULL)
-            .put("focus_s", seconds)
-            .put("cursor_s", 0)
-            .put("active_s", seconds)
-            .put("updated_at", isoUtcMs(u.updatedMs))
+    /** Forgets what came from other devices; every transport then pulls from the start. */
+    fun resetRemote() {
+        Graph.db.deleteRemote()
+        for (name in TRANSPORTS) Graph.prefs.setCursor(name, "0")
     }
 
-    private fun rejectedIds(part: JSONObject): Set<String> {
-        val list = part.getJSONArray("rejected")
-        return (0 until list.length()).map { list.getJSONObject(it).getString("id") }.toSet()
-    }
-
-    private fun push(server: String, token: String): Int {
+    private fun push(transport: Transport): Int {
         val db = Graph.db
         var rejectedCount = 0
         while (true) {
-            val intervals = db.dirtyIntervals(BATCH)
-            val usage = db.dirtyUsage(BATCH)
+            val intervals = db.pendingIntervals(transport.name, BATCH)
+            val usage = db.pendingUsage(transport.name, BATCH)
             if (intervals.isEmpty() && usage.isEmpty()) return rejectedCount
-            val body = JSONObject()
-                .put("intervals", JSONArray().also { a -> intervals.forEach { a.put(intervalJson(it)) } })
-                .put("app_usage_daily", JSONArray().also { a -> usage.forEach { a.put(usageJson(it)) } })
-            val result = Api.call(server, "POST", "/v1/sync/push", body, token)
-            val badIntervals = rejectedIds(result.getJSONObject("intervals"))
-            // The server names an app usage row as "<date>|<app>|<monitor>"; phones have no monitor.
-            val badUsage = rejectedIds(result.getJSONObject("app_usage_daily"))
-            db.markClean(intervals.filter { it.id !in badIntervals })
-            db.markUsageClean(usage.filter { "${it.day}|${it.app.take(255)}|" !in badUsage })
-            rejectedCount += badIntervals.size + badUsage.size
+            val bad = transport.send(intervals, usage)
+            val badIds = bad.intervals.map { it.id }.toSet()
+            val badUsage = bad.usage.toSet()
+            db.markSent(transport.name, intervals.filter { it.id !in badIds }, usage.filter { it !in badUsage })
+            rejectedCount += bad.count
             // Rejected rows stay unsent; stop here, or the next round would send them again forever.
-            if (badIntervals.isNotEmpty() || badUsage.isNotEmpty()) return rejectedCount
+            if (bad.count > 0) return rejectedCount
         }
     }
 
-    private fun pull(server: String, token: String) {
+    private fun pull(transport: Transport) {
         val prefs = Graph.prefs
         var restarted = false
         while (true) {
-            val query = "cursor=${URLEncoder.encode(prefs.cursor, "UTF-8")}&limit=$BATCH"
+            val cursor = prefs.cursor(transport.name)
             val page = try {
-                Api.call(server, "GET", "/v1/sync/pull?$query", null, token)
-            } catch (e: SyncException) {
-                if (e.status == 400 && prefs.cursor != "0" && !restarted) {
-                    // The server doesn't know our cursor (e.g. it was restored from an older backup).
-                    prefs.cursor = "0"
-                    Graph.db.deleteRemote()
+                transport.fetch(cursor, BATCH)
+            } catch (e: CursorUnknownException) {
+                if (cursor != "0" && !restarted) {
+                    resetRemote()
                     restarted = true
                     continue
                 }
                 throw e
             }
-            val rows = page.getJSONArray("intervals")
-            for (n in 0 until rows.length()) {
-                val r = rows.getJSONObject(n)
-                Graph.db.applyRemote(
-                    Interval(
-                        id = r.getString("id"),
-                        kind = r.getString("kind"),
-                        start = Instant.parse(r.getString("start_utc")).epochSecond,
-                        end = Instant.parse(r.getString("end_utc")).epochSecond,
-                        source = r.getString("source"),
-                        updatedMs = Instant.parse(r.getString("updated_at")).toEpochMilli(),
-                        mine = false,
-                        deleted = !r.isNull("deleted_at"),
-                        dirty = false,
-                    ),
-                )
-            }
-            prefs.cursor = page.getString("cursor") // moved only after the page is saved
-            if (!page.getBoolean("has_more")) return
+            Graph.db.applyRemote(page.intervals.map { if (it.source.isEmpty()) it.copy(source = "unknown") else it }, transport.name)
+            prefs.setCursor(transport.name, page.cursor) // moved only after the page is saved
+            if (!page.hasMore) return
         }
     }
 }

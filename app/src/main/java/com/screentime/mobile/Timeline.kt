@@ -10,10 +10,11 @@ data class TimelinePart(val title: String, val color: Color, val spans: List<Spa
 
 data class TimelineRow(val name: String, val summary: String, val parts: List<TimelinePart>)
 
-val COLOR_ON_LIGHT = Color(0xFF93C5FD)
 val COLOR_ON = Color(0xFF2563EB)
 val COLOR_PHONE = Color(0xFFF97316)
 val COLOR_SLEEP = Color(0xFF7C3AED)
+val COLOR_NOW = Color(0xFF4B5563) // the now-line, as in the Windows app
+val COLOR_NOW_DARK = Color(0xFF9CA3AF) // the same gray, lighter so it shows on a dark background
 
 /** Laptop, phone and sleep rows for one day, built from the local database. */
 object Timelines {
@@ -40,24 +41,11 @@ object Timelines {
     fun total(spans: List<Span>): Long = spans.sumOf { it.end - it.start }
 
     fun rows(day: LocalDate): List<TimelineRow> {
-        val on = spans(listOf("pc_on"), day)
-        val active = spans(listOf("pc_active"), day)
+        val on = spans(listOf("pc_on"), day) // PC on, idle time included, like the Windows app's laptop row
         val phone = spans(listOf("phone_active"), day)
         val sleep = spans(listOf("sleep"), day)
-        val laptop = when {
-            active.isNotEmpty() -> listOf(
-                TimelinePart("Laptop · PC on", COLOR_ON_LIGHT, on),
-                TimelinePart("Laptop · Active", COLOR_ON, active),
-            )
-            else -> listOf(TimelinePart("Laptop · PC on", COLOR_ON, on))
-        }
-        val laptopSummary = when {
-            active.isNotEmpty() -> "${short(total(active))} active"
-            on.isNotEmpty() -> "${short(total(on))} on"
-            else -> ""
-        }
         return listOf(
-            TimelineRow("Laptop", laptopSummary, laptop),
+            TimelineRow("Laptop", if (on.isEmpty()) "" else "${short(total(on))} on", listOf(TimelinePart("Laptop · PC on", COLOR_ON, on))),
             TimelineRow("Phone", if (phone.isEmpty()) "" else short(total(phone)), listOf(TimelinePart("Phone · Active", COLOR_PHONE, phone))),
             TimelineRow("Sleep", if (sleep.isEmpty()) "" else short(total(sleep)), listOf(TimelinePart("Sleep", COLOR_SLEEP, sleep))),
         )
