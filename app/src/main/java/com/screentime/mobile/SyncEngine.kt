@@ -29,20 +29,20 @@ object SyncEngine {
         else -> throw IllegalArgumentException("unknown transport $name")
     }
 
-    /** Syncs over each transport of the sync mode; one failing doesn't stop the others. */
+    /**
+     * Syncs over each transport of the sync mode (with both: the laptop, then the server). Each runs on its
+     * own: one that can't be reached neither stops nor touches the other, and each keeps its own cursor.
+     */
     fun run(trigger: Trigger): List<Outcome> = synchronized(lock) {
-        MODES.getValue(Graph.prefs.syncMode).map { name ->
-            try {
-                if (name == "direct") checkDirect(trigger)
-                val transport = transportFor(name)
-                val rejected = push(transport)
-                pull(transport)
-                if (name == "direct") Graph.prefs.directMisses = 0
-                Outcome(name, rejected, null, transport.note)
-            } catch (e: SyncException) {
-                if (name == "direct" && e is LaptopNotFoundException) Graph.prefs.directMisses += 1
-                Outcome(name, 0, e, quiet = name == "direct" && DirectPolicy.quiet(trigger, e))
-            }
+        val core = SyncCore(Graph.db, Graph.prefs, BATCH)
+        core.syncAll(MODES.getValue(Graph.prefs.syncMode)) { name ->
+            if (name == "direct") checkDirect(trigger)
+            transportFor(name)
+        }.map { o ->
+            if (o.transport != "direct") return@map o
+            val e = o.error
+            if (e == null) Graph.prefs.directMisses = 0 else if (e is LaptopNotFoundException) Graph.prefs.directMisses += 1
+            if (e == null) o else Outcome(o.transport, o.rejected, e, o.note, quiet = DirectPolicy.quiet(trigger, e))
         }
     }
 
@@ -64,47 +64,12 @@ object SyncEngine {
         if (!Net.onLocalNetwork(Graph.appContext)) throw NoWifiException() // Sync now or opening the app: say so
     }
 
-    /** Forgets what came from other devices; every transport then pulls from the start. */
-    fun resetRemote() {
-        Graph.db.deleteRemote()
-        for (name in TRANSPORTS) Graph.prefs.setCursor(name, "0")
-    }
-
-    private fun push(transport: Transport): Int {
-        val db = Graph.db
-        var rejectedCount = 0
-        while (true) {
-            val intervals = db.pendingIntervals(transport.name, BATCH)
-            val usage = db.pendingUsage(transport.name, BATCH)
-            if (intervals.isEmpty() && usage.isEmpty()) return rejectedCount
-            val bad = transport.send(intervals, usage)
-            val badIds = bad.intervals.map { it.id }.toSet()
-            val badUsage = bad.usage.toSet()
-            db.markSent(transport.name, intervals.filter { it.id !in badIds }, usage.filter { it !in badUsage })
-            rejectedCount += bad.count
-            // Rejected rows stay unsent; stop here, or the next round would send them again forever.
-            if (bad.count > 0) return rejectedCount
-        }
-    }
-
-    private fun pull(transport: Transport) {
-        val prefs = Graph.prefs
-        var restarted = false
-        while (true) {
-            val cursor = prefs.cursor(transport.name)
-            val page = try {
-                transport.fetch(cursor, BATCH)
-            } catch (e: CursorUnknownException) {
-                if (cursor != "0" && !restarted) {
-                    resetRemote()
-                    restarted = true
-                    continue
-                }
-                throw e
-            }
-            Graph.db.applyRemote(page.intervals.map { if (it.source.isEmpty()) it.copy(source = "unknown") else it }, transport.name)
-            prefs.setCursor(transport.name, page.cursor) // moved only after the page is saved
-            if (!page.hasMore) return
-        }
+    /**
+     * Forgets the server's side only: the rows only it delivered, and its cursor (after connecting to a
+     * server or disconnecting). What the laptop delivered, and the laptop's cursor, stay.
+     */
+    fun forgetServer() {
+        Graph.db.forgetRoute("server")
+        Graph.prefs.setCursor("server", "0")
     }
 }

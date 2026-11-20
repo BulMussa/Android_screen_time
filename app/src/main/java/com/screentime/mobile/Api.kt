@@ -97,7 +97,7 @@ object Api {
                 prefs.server = server
                 prefs.deviceId = deviceId
                 prefs.deviceName = registeredName
-                SyncEngine.resetRemote()
+                SyncEngine.forgetServer() // a new server has its own history to pull; the laptop's stays
                 Graph.db.forgetSent("server") // send the history already on the phone
             }
         } catch (e: JSONException) {
@@ -112,6 +112,6 @@ object Api {
         prefs.server = null
         prefs.deviceId = -1
         prefs.deviceName = null
-        SyncEngine.resetRemote()
+        SyncEngine.forgetServer()
     }
 }

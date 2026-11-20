@@ -7,7 +7,7 @@ import androidx.security.crypto.MasterKey
 import java.util.UUID
 
 /** Settings and the device token. The token is kept encrypted; the password is never stored. */
-class Prefs(context: Context) {
+class Prefs(context: Context) : CursorStore {
     private val plain: SharedPreferences = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val secret: SharedPreferences = EncryptedSharedPreferences.create(
         context,
@@ -49,12 +49,12 @@ class Prefs(context: Context) {
         }
 
     /** Where we are in a transport's changes ("0" = from the start). Before transports, the server's was "cursor". */
-    fun cursor(transport: String): String =
+    override fun cursor(transport: String): String =
         plain.getString("cursor_$transport", null)
             ?: (if (transport == "server") plain.getString("cursor", null) else null)
             ?: "0"
 
-    fun setCursor(transport: String, value: String) {
+    override fun setCursor(transport: String, value: String) {
         val edit = plain.edit().putString("cursor_$transport", value)
         if (transport == "server") edit.remove("cursor")
         edit.apply()

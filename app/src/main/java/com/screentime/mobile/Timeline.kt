@@ -20,14 +20,21 @@ val COLOR_NOW_DARK = Color(0xFF9CA3AF) // the same gray, lighter so it shows on 
 object Timelines {
     private const val DAY = 86_400L
 
-    fun spans(kinds: List<String>, day: LocalDate): List<Span> {
+    fun spans(kinds: List<String>, day: LocalDate, db: Db = Graph.db): List<Span> {
         val from = startOfDay(day)
         val to = startOfDay(day.plusDays(1))
-        val cut = Graph.db.overlapping(kinds, from, to)
-            .map { Span(maxOf(it.start, from) - from, minOf(minOf(it.end, to) - from, DAY)) }
-            .filter { it.end > it.start }
-        return merge(cut)
+        return cut(db.overlapping(kinds, from, to), from, to)
     }
+
+    /**
+     * The rows of one day [from, to) (seconds) as merged spans after that midnight. Only kind and times count,
+     * so a row looks the same whichever route (server or laptop) brought it.
+     */
+    fun cut(rows: List<Interval>, from: Long, to: Long): List<Span> = merge(
+        rows.filter { !it.deleted }
+            .map { Span(maxOf(it.start, from) - from, minOf(minOf(it.end, to) - from, DAY)) }
+            .filter { it.end > it.start },
+    )
 
     fun merge(spans: List<Span>): List<Span> {
         val merged = ArrayList<Span>()

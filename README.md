@@ -9,7 +9,7 @@ Everything stays between this phone, your server and your laptop; nothing goes a
 - **Phone use:** reads Android's usage statistics (needs the *Usage access* permission) and records when the screen was on and how long each app was in the foreground. A background job runs about every 15 minutes, and again whenever the app is opened.
 - **Sleep:** the first time, choose how you measure it. *Smartwatch or band* reads sleep sessions from Health Connect, so your band's app (for example Mi Fitness) must share sleep with Health Connect. *Manually* lets you add bed and wake times. If no sleep is recorded for last night, a reminder notification comes once a day after 09:00.
 - **Sync:** sends changes to the server and fetches what other devices sent (laptop periods, in particular), every 15 minutes and on demand. It works offline: everything is kept in a local database and sent later.
-- **Sync with** (in Settings): **Server** (the default), **Laptop directly** or **Both**. Each way of syncing is a transport with two calls: send the rows that changed, and fetch the rows changed since a cursor. Each transport keeps its own record of what it already sent and where its last pull stopped, so switching never sends rows twice. With **Both**, the laptop syncs first, then the server, and one failing doesn't stop the other; the status line then says how each went.
+- **Sync with** (in Settings): **Server** (the default), **Laptop directly** or **Both**; see [Sync modes](#sync-modes).
 - **Laptop** (in Settings): sync directly with the Windows app over your own network, without a server. On the laptop, tick **Allow phone sync** and choose **Pair a phone…**; on the phone, tap **Pair with laptop** and scan the QR code. Scanning uses ZXing inside the app (no Google Play services), and the camera is only asked for, with an explanation first, when you tap the button. When the laptop's address changes, the phone finds it again by itself (see [Finding the laptop](#finding-the-laptop)); the sync status says how it was found, e.g. `Synced at 12:30 · laptop found via broadcast (192.168.1.20)`. If you'd rather not use the camera, **Enter code** takes the laptop's IP address, port, pairing secret and certificate fingerprint typed by hand. Pairing switches **Sync with** from Server to Both (or to Laptop directly when no server is connected). **Remove pairing** makes the phone forget the laptop; to revoke the phone on the laptop as well, use **Remove pairing** there too. See [Direct sync with the laptop](#direct-sync-with-the-laptop).
 - **Backup** (in Settings): **Export backup** saves a JSON file, through the system file picker, with this phone's periods and app times (in the same format that is sent to the server) and the periods it has from other devices, deleted ones included. **Import backup** merges a backup in: every row has an `updated_at`, and the newer copy wins, the same rule a sync uses, so an old backup can't bring back a period that was deleted since. Backups use the same format as the Windows app's, so a PC backup can be imported here and the other way round. Periods are merged from any backup; this phone's own periods and app times only count as its own (and are sent on the next sync) when the backup is from this same install. From another install they are kept and shown, but not sent, and another device's app times are left out.
 - **Security:** the server address must be HTTPS. The password is used once to register the phone and is never stored. The device token, and the laptop's pairing secret, key and pinned certificate, are kept encrypted with a key from the Android Keystore.
@@ -48,7 +48,8 @@ app/src/main/java/com/screentime/mobile/
   Ui.kt              screens: setup, timelines, sleep, settings
   Timeline.kt        builds the three rows for a day from the database
   Collectors.kt      phone use (usage statistics) and sleep (Health Connect)
-  SyncEngine.kt      sync mode; push and pull over each transport
+  SyncEngine.kt      sync mode and when each transport runs
+  SyncCore.kt        push and pull over a transport, the merge rule (no Android classes)
   Transport.kt       the Transport interface, the server transport, rows as JSON
   Backup.kt          backup export and import
   DirectTransport.kt the laptop as a transport: pinned HTTPS, proofs, pairing; the real discovery sources
@@ -67,12 +68,33 @@ app/src/main/java/com/screentime/mobile/
 app/src/test/java/com/screentime/mobile/
   PeerCryptoTest.kt  unit tests for Peer.kt
   DiscoveryTest.kt   unit tests for Discovery.kt, with fake sources: the order, the timeouts, the messages
+  BothModeTest.kt    "both" with a fake server and a fake laptop: overlapping and conflicting rows,
+                     cursors, one route down, timelines
   SyncPolicyTest.kt  unit tests for SyncPolicy.kt: every status text, when the background tries, the backoff
 app/src/androidTest/java/com/screentime/mobile/
   DiscoveryLiveTest.kt  the real sources against a real laptop; skipped unless it's named (see the file)
+  BothModeDbTest.kt     "both" against the real SQLite database (throwaway files), and the upgrade to v3
   StatusLiveTest.kt     the status texts for a wrong secret, a wrong key and no laptop, against a scratch listener
   BackgroundRunTest.kt  runs what the background job runs, once (WorkManager won't run periodic work early)
 ```
+
+## Sync modes
+
+Rows from other devices (the laptop's PC-on and active periods, and phone and sleep periods from elsewhere) arrive by two routes: the **server**, and the **laptop directly** over your own network.
+
+| Mode | What syncs | Order |
+|---|---|---|
+| **Server** (the default) | your server only, as before | |
+| **Laptop directly** | the paired laptop only (`DirectTransport`) | |
+| **Both** | the laptop, then the server | the laptop first |
+
+Each way of syncing is a transport with two calls: send the rows that changed, and fetch the rows changed since a cursor. The two transports are independent:
+
+- **Progress.** Each keeps its own record of what it already sent, and its own pull cursor; one never moves the other's, so switching modes never sends rows twice.
+- **Failures.** In **Both**, one that can't be reached (the server offline, the laptop off) neither stops nor changes the other; the status line says how each went.
+- **Resets.** If one side doesn't know the cursor (e.g. it was restored from an older backup), only that transport pulls again from the start. Nothing is deleted, and the rows pulled again change nothing. Connecting to another server or disconnecting forgets only the rows that came from the server alone. Rows the laptop also delivered stay, along with the laptop's cursor; so do rows stored before routes were recorded.
+- **Merging.** Every row has an ID that doesn't depend on the route (made from the device and the period), and an `updated_at`. A row is merged the same way whichever route brings it: the newer `updated_at` wins; on the same `updated_at` a deletion wins over a live copy, so the result doesn't depend on which route was heard first; otherwise the copy already stored stays, so the same row arriving by both routes is applied once. Each stored row also remembers which routes delivered it.
+- **Timelines.** Only a row's kind and times are drawn, so a period looks the same whichever route brought it.
 
 ## Direct sync with the laptop
 
@@ -120,4 +142,3 @@ what the access is for before Android asks, and the status says so if it isn't a
 - The laptop must be reachable on its private address, so direct sync works only on the same network (or one routed to it). Some Wi-Fi networks (guest networks, "client isolation") block broadcasts or traffic between devices; then enter the laptop's address in Settings, or it can't be reached at all.
 - When the laptop uses the phone's hotspot, the Wi-Fi gateway is the phone itself, so step 3 doesn't help; the broadcast to the hotspot's own broadcast address finds the laptop there.
 - Removing the pairing on the phone doesn't revoke it on the laptop; use **Remove pairing** there too.
-- Connecting to a server, disconnecting, or the server not knowing the pull cursor clears the periods from other devices and pulls them again. That also clears periods imported from another device's backup that the server doesn't have, so import a backup after connecting.
