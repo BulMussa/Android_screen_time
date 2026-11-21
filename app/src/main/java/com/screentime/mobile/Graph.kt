@@ -11,7 +11,8 @@ object Graph {
     lateinit var appContext: Context
         private set
     val prefs: Prefs by lazy { Prefs(appContext) }
-    val db: Db by lazy { Db(appContext) }
+    /** An empty database (first start, or a damaged file moved aside) pulls every transport from the start. */
+    val db: Db by lazy { Db(appContext, onFresh = { SyncEngine.TRANSPORTS.forEach { prefs.setCursor(it, "0") } }) }
 
     fun init(context: Context) {
         appContext = context.applicationContext

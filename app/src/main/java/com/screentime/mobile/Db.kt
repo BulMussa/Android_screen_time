@@ -3,8 +3,10 @@ package com.screentime.mobile
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
+import android.database.DatabaseErrorHandler
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.io.File
 
 /**
  * A period of one kind: "pc_on", "pc_active", "phone_active" or "sleep".
@@ -32,13 +34,53 @@ data class Usage(val day: String, val app: String, val seconds: Long, val update
  * is waiting for a transport until that transport has a record of it at its current updated_ts.
  * Each row from another device remembers which routes delivered it ("routes", [RowMerge] bits), so
  * forgetting one route (disconnecting the server) leaves what the other route brought. [name] is for tests.
+ *
+ * Upgrades run in one transaction with the version change (SQLiteOpenHelper), so an interrupted upgrade
+ * leaves the old version as it was, and the routes step checks the schema, so repeating it changes nothing.
+ * A damaged file is moved aside as "<name>.damaged-<time>" (never deleted, unlike Android's default) and
+ * an empty database takes its place; [onFresh] runs whenever a database is created empty, so the caller
+ * can pull everything again (its cursors would otherwise skip the rows the old file had).
  */
-class Db(context: Context, name: String = "screentime.db") : SQLiteOpenHelper(context, name, null, 3), SyncStore {
+class Db(context: Context, name: String = "screentime.db", private val onFresh: () -> Unit = {}) :
+    SQLiteOpenHelper(context, name, null, 3, KeepDamaged), SyncStore {
     override fun onCreate(db: SQLiteDatabase) {
         createIntervals(db, "intervals")
         db.execSQL("CREATE INDEX intervals_start ON intervals (start_ts)")
         createUsage(db, "app_usage")
         createSent(db)
+        onFresh()
+    }
+
+    /** Moves a damaged database file aside instead of deleting it, so it can still be recovered by hand. */
+    private object KeepDamaged : DatabaseErrorHandler {
+        override fun onCorruption(db: SQLiteDatabase) {
+            val path = db.path
+            if (db.isOpen) runCatching { db.close() }
+            moveAside(path)
+        }
+    }
+
+    companion object {
+        private const val COLS = "id, kind, start_ts, end_ts, source, updated_ts, mine, deleted"
+
+        /** Renames [path] and its journal files to "<path>.damaged-<time>..."; returns the new main file, if any. */
+        fun moveAside(path: String): File? {
+            if (path == ":memory:" || path.isEmpty()) return null
+            val stamp = System.currentTimeMillis()
+            var moved: File? = null
+            for (suffix in listOf("", "-journal", "-wal", "-shm")) {
+                val file = File(path + suffix)
+                val aside = File("$path.damaged-$stamp$suffix")
+                if (file.exists() && file.renameTo(aside) && suffix.isEmpty()) moved = aside
+            }
+            return moved
+        }
+
+        private fun hasColumn(db: SQLiteDatabase, table: String, column: String): Boolean =
+            db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+                val name = c.getColumnIndexOrThrow("name")
+                generateSequence { if (c.moveToNext()) c.getString(name) else null }.any { it == column }
+            }
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -67,7 +109,9 @@ class Db(context: Context, name: String = "screentime.db") : SQLiteOpenHelper(co
             db.execSQL("DROP TABLE app_usage")
             db.execSQL("ALTER TABLE app_usage_v2 RENAME TO app_usage")
         }
-        if (oldVersion < 3) {
+        if (oldVersion < 3 && !hasColumn(db, "intervals", "routes")) {
+            // Skipped when the column is already there (the step repeated), so routes recorded since stay as
+            // they are. A row left with routes 0 is never forgotten (see forgetRoute), so that's safe too.
             db.execSQL("ALTER TABLE intervals ADD COLUMN routes INTEGER NOT NULL DEFAULT 0")
             // Which route brought the rows already here isn't known: count them as both, so that forgetting
             // one route never drops what the other may have delivered.
@@ -304,9 +348,5 @@ class Db(context: Context, name: String = "screentime.db") : SQLiteOpenHelper(co
             usageStored++
         }
         stored to usageStored
-    }
-
-    private companion object {
-        const val COLS = "id, kind, start_ts, end_ts, source, updated_ts, mine, deleted"
     }
 }
