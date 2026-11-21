@@ -3,8 +3,10 @@ package com.screentime.mobile
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
+import android.database.DatabaseErrorHandler
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.io.File
 
 /**
  * A period of one kind: "pc_on", "pc_active", "phone_active" or "sleep".
@@ -30,13 +32,55 @@ data class Usage(val day: String, val app: String, val seconds: Long, val update
 /**
  * The local database. What was sent is kept per transport in the "sent" table: a row of this phone
  * is waiting for a transport until that transport has a record of it at its current updated_ts.
+ * Each row from another device remembers which routes delivered it ("routes", [RowMerge] bits), so
+ * forgetting one route (disconnecting the server) leaves what the other route brought. [name] is for tests.
+ *
+ * Upgrades run in one transaction with the version change (SQLiteOpenHelper), so an interrupted upgrade
+ * leaves the old version as it was, and the routes step checks the schema, so repeating it changes nothing.
+ * A damaged file is moved aside as "<name>.damaged-<time>" (never deleted, unlike Android's default) and
+ * an empty database takes its place; [onFresh] runs whenever a database is created empty, so the caller
+ * can pull everything again (its cursors would otherwise skip the rows the old file had).
  */
-class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2) {
+class Db(context: Context, name: String = "screentime.db", private val onFresh: () -> Unit = {}) :
+    SQLiteOpenHelper(context, name, null, 3, KeepDamaged), SyncStore {
     override fun onCreate(db: SQLiteDatabase) {
         createIntervals(db, "intervals")
         db.execSQL("CREATE INDEX intervals_start ON intervals (start_ts)")
         createUsage(db, "app_usage")
         createSent(db)
+        onFresh()
+    }
+
+    /** Moves a damaged database file aside instead of deleting it, so it can still be recovered by hand. */
+    private object KeepDamaged : DatabaseErrorHandler {
+        override fun onCorruption(db: SQLiteDatabase) {
+            val path = db.path
+            if (db.isOpen) runCatching { db.close() }
+            moveAside(path)
+        }
+    }
+
+    companion object {
+        private const val COLS = "id, kind, start_ts, end_ts, source, updated_ts, mine, deleted"
+
+        /** Renames [path] and its journal files to "<path>.damaged-<time>..."; returns the new main file, if any. */
+        fun moveAside(path: String): File? {
+            if (path == ":memory:" || path.isEmpty()) return null
+            val stamp = System.currentTimeMillis()
+            var moved: File? = null
+            for (suffix in listOf("", "-journal", "-wal", "-shm")) {
+                val file = File(path + suffix)
+                val aside = File("$path.damaged-$stamp$suffix")
+                if (file.exists() && file.renameTo(aside) && suffix.isEmpty()) moved = aside
+            }
+            return moved
+        }
+
+        private fun hasColumn(db: SQLiteDatabase, table: String, column: String): Boolean =
+            db.rawQuery("PRAGMA table_info($table)", null).use { c ->
+                val name = c.getColumnIndexOrThrow("name")
+                generateSequence { if (c.moveToNext()) c.getString(name) else null }.any { it == column }
+            }
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -49,7 +93,11 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
             db.execSQL(
                 "INSERT INTO sent SELECT 'server', 'app_usage', day || '|' || app, updated_ts FROM app_usage WHERE dirty = 0",
             )
-            createIntervals(db, "intervals_v2")
+            db.execSQL( // the version 2 table, without the routes of version 3
+                "CREATE TABLE intervals_v2 (id TEXT PRIMARY KEY, kind TEXT NOT NULL, start_ts INTEGER NOT NULL, " +
+                    "end_ts INTEGER NOT NULL, source TEXT NOT NULL, updated_ts INTEGER NOT NULL, " +
+                    "mine INTEGER NOT NULL, deleted INTEGER NOT NULL)",
+            )
             db.execSQL(
                 "INSERT INTO intervals_v2 SELECT id, kind, start_ts, end_ts, source, updated_ts, mine, deleted FROM intervals",
             )
@@ -61,12 +109,20 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
             db.execSQL("DROP TABLE app_usage")
             db.execSQL("ALTER TABLE app_usage_v2 RENAME TO app_usage")
         }
+        if (oldVersion < 3 && !hasColumn(db, "intervals", "routes")) {
+            // Skipped when the column is already there (the step repeated), so routes recorded since stay as
+            // they are. A row left with routes 0 is never forgotten (see forgetRoute), so that's safe too.
+            db.execSQL("ALTER TABLE intervals ADD COLUMN routes INTEGER NOT NULL DEFAULT 0")
+            // Which route brought the rows already here isn't known: count them as both, so that forgetting
+            // one route never drops what the other may have delivered.
+            db.execSQL("UPDATE intervals SET routes = ${RowMerge.ROUTE_SERVER or RowMerge.ROUTE_DIRECT} WHERE mine = 0")
+        }
     }
 
     private fun createIntervals(db: SQLiteDatabase, name: String) = db.execSQL(
         "CREATE TABLE $name (id TEXT PRIMARY KEY, kind TEXT NOT NULL, start_ts INTEGER NOT NULL, " +
             "end_ts INTEGER NOT NULL, source TEXT NOT NULL, updated_ts INTEGER NOT NULL, " +
-            "mine INTEGER NOT NULL, deleted INTEGER NOT NULL)",
+            "mine INTEGER NOT NULL, deleted INTEGER NOT NULL, routes INTEGER NOT NULL DEFAULT 0)",
     )
 
     private fun createUsage(db: SQLiteDatabase, name: String) = db.execSQL(
@@ -99,7 +155,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
             rows
         }
 
-    private fun put(i: Interval) {
+    /** [routes]: the routes that delivered a row from another device (0 for this phone's own and imported rows). */
+    private fun put(i: Interval, routes: Int = 0) {
         val values = ContentValues().apply {
             put("id", i.id)
             put("kind", i.kind)
@@ -109,6 +166,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
             put("updated_ts", i.updatedMs)
             put("mine", if (i.mine) 1 else 0)
             put("deleted", if (i.deleted) 1 else 0)
+            put("routes", routes)
         }
         writableDatabase.insertWithOnConflict("intervals", null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -160,14 +218,31 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
         put(i.copy(updatedMs = maxOf(nowMs(), (old?.updatedMs ?: 0L) + 1), mine = true))
     }
 
-    /** Rows fetched from [transport]: each is kept only if it is newer than ours. Returns how many were stored. */
+    /** The routes recorded for a row (0 if it's unknown or this phone's own). */
+    private fun routesOf(id: String): Int =
+        readableDatabase.rawQuery("SELECT routes FROM intervals WHERE id = ?", arrayOf(id)).use { c ->
+            if (c.moveToFirst()) c.getInt(0) else 0
+        }
+
+    /**
+     * Rows fetched from [transport], merged with [RowMerge]: the newer copy wins, a deletion wins a tie, and
+     * the same row arriving by both routes is stored once. Either way the route is remembered. Returns how
+     * many were stored.
+     */
     @Synchronized
-    fun applyRemote(rows: List<Interval>, transport: String): Int = transaction {
+    override fun applyRemote(rows: List<Interval>, transport: String): Int = transaction {
+        val route = RowMerge.route(transport)
         var stored = 0
         for (i in rows) {
             val old = get(i.id)
-            if (old != null && old.updatedMs >= i.updatedMs) continue
-            put(i.copy(mine = old?.mine ?: false))
+            val routes = (if (old != null) routesOf(i.id) else 0) or route
+            if (!RowMerge.replaces(old, i)) {
+                if (old != null && !old.mine) {
+                    writableDatabase.execSQL("UPDATE intervals SET routes = ? WHERE id = ?", arrayOf<Any>(routes, i.id))
+                }
+                continue
+            }
+            put(i.copy(mine = old?.mine ?: false), if (old?.mine == true) 0 else routes)
             // One of our own rows, changed elsewhere: that transport has it already, so don't send it back.
             if (old?.mine == true) recordSent(transport, "intervals", i.id, i.updatedMs)
             stored++
@@ -177,14 +252,14 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
 
     /** This phone's rows that [transport] doesn't have in their current version. */
     @Synchronized
-    fun pendingIntervals(transport: String, limit: Int): List<Interval> = query(
+    override fun pendingIntervals(transport: String, limit: Int): List<Interval> = query(
         "mine = 1 AND NOT EXISTS (SELECT 1 FROM sent s WHERE s.transport = ? AND s.tbl = 'intervals' " +
             "AND s.key = intervals.id AND s.updated_ts = intervals.updated_ts)",
         arrayOf(transport), "ORDER BY start_ts LIMIT $limit",
     )
 
     @Synchronized
-    fun pendingUsage(transport: String, limit: Int): List<Usage> = queryUsage(
+    override fun pendingUsage(transport: String, limit: Int): List<Usage> = queryUsage(
         "NOT EXISTS (SELECT 1 FROM sent s WHERE s.transport = ? AND s.tbl = 'app_usage' " +
             "AND s.key = app_usage.day || '|' || app_usage.app AND s.updated_ts = app_usage.updated_ts)",
         arrayOf(transport), "ORDER BY day LIMIT $limit",
@@ -195,7 +270,7 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
      * while being sent has a newer updated_ts, so it stays waiting.
      */
     @Synchronized
-    fun markSent(transport: String, intervals: List<Interval>, usage: List<Usage>) = transaction {
+    override fun markSent(transport: String, intervals: List<Interval>, usage: List<Usage>) = transaction {
         for (r in intervals) recordSent(transport, "intervals", r.id, r.updatedMs)
         for (u in usage) recordSent(transport, "app_usage", u.key, u.updatedMs)
     }
@@ -229,11 +304,20 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
     @Synchronized
     fun allUsage(): List<Usage> = queryUsage("1", emptyArray(), "ORDER BY day, app")
 
-    /** Forgets what came from other devices (the phone's own rows stay). */
+    /**
+     * Forgets what only [transport] delivered (e.g. after disconnecting the server); rows the other route also
+     * delivered stay, and this phone's own and imported rows are never touched.
+     */
     @Synchronized
-    fun deleteRemote() {
-        writableDatabase.execSQL("DELETE FROM intervals WHERE mine = 0")
+    fun forgetRoute(transport: String) = transaction {
+        val route = RowMerge.route(transport)
+        writableDatabase.execSQL("DELETE FROM intervals WHERE mine = 0 AND routes = ?", arrayOf<Any>(route))
+        writableDatabase.execSQL("UPDATE intervals SET routes = routes & ~? WHERE mine = 0", arrayOf<Any>(route))
     }
+
+    /** The routes that delivered a row, for tests. */
+    @Synchronized
+    fun routes(id: String): Int = routesOf(id)
 
     @Synchronized
     fun saveUsage(day: String, app: String, seconds: Long) {
@@ -243,16 +327,17 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
     }
 
     /**
-     * Merges a backup in one transaction, so a failure changes nothing: for each row, the copy with the
-     * newer updated_ts wins. A row that was ours stays ours. Returns (intervals stored, usage rows stored).
+     * Merges a backup in one transaction, so a failure changes nothing: each row with [RowMerge] (the newer
+     * copy wins, a deletion wins a tie). A row that was ours stays ours; a row from another device keeps its routes. Returns (intervals stored, usage rows stored).
      */
     @Synchronized
     fun mergeBackup(intervals: List<Interval>, usage: List<Usage>): Pair<Int, Int> = transaction {
         var stored = 0
         for (i in intervals) {
             val old = get(i.id)
-            if (old != null && old.updatedMs >= i.updatedMs) continue
-            put(i.copy(mine = i.mine || old?.mine == true, source = i.source.ifEmpty { old?.source ?: "imported" }))
+            if (!RowMerge.replaces(old, i)) continue
+            val mine = i.mine || old?.mine == true
+            put(i.copy(mine = mine, source = i.source.ifEmpty { old?.source ?: "imported" }), if (mine || old == null) 0 else routesOf(i.id))
             stored++
         }
         var usageStored = 0
@@ -263,9 +348,5 @@ class Db(context: Context) : SQLiteOpenHelper(context, "screentime.db", null, 2)
             usageStored++
         }
         stored to usageStored
-    }
-
-    private companion object {
-        const val COLS = "id, kind, start_ts, end_ts, source, updated_ts, mine, deleted"
     }
 }

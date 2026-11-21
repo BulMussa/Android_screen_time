@@ -1,8 +1,13 @@
 package com.screentime.mobile
 
+import android.Manifest
+import android.app.Activity
 import android.app.TimePickerDialog
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
@@ -63,7 +68,10 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.health.connect.client.PermissionController
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
@@ -75,11 +83,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private enum class Screen { SETUP, HOME, SLEEP, SETTINGS }
+private enum class Screen { SETUP, HOME, SLEEP, SETTINGS, LOCAL_NETWORK }
 
 @Composable
 fun AppRoot() {
-    var screen by remember { mutableStateOf(if (Graph.prefs.connected) Screen.HOME else Screen.SETUP) }
+    // A paired laptop counts as set up too: "Laptop directly" needs no server
+    var screen by remember { mutableStateOf(if (Graph.prefs.connected || Graph.prefs.peer != null) Screen.HOME else Screen.SETUP) }
     var tick by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
         while (true) { // the background sync may have brought new data
@@ -87,7 +96,9 @@ fun AppRoot() {
             tick++
         }
     }
-    BackHandler(enabled = screen != Screen.HOME && screen != Screen.SETUP) { screen = Screen.HOME }
+    BackHandler(enabled = screen != Screen.HOME && screen != Screen.SETUP) {
+        screen = if (screen == Screen.LOCAL_NETWORK) Screen.SETTINGS else Screen.HOME
+    }
     val page = Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp)
     when (screen) {
         Screen.SETUP -> SetupScreen(page, onDone = { screen = Screen.HOME })
@@ -96,7 +107,9 @@ fun AppRoot() {
         Screen.SETTINGS -> SettingsScreen(
             page, tick, onBack = { screen = Screen.HOME },
             onDisconnected = { screen = Screen.SETUP },
+            onLocalNetwork = { screen = Screen.LOCAL_NETWORK },
         )
+        Screen.LOCAL_NETWORK -> LocalNetworkScreen(page, onDone = { screen = Screen.SETTINGS })
     }
 }
 
@@ -203,7 +216,7 @@ private fun HomeScreen(modifier: Modifier, tick: Int, onSleep: () -> Unit, onSet
                     syncing = true
                     status = "Syncing…"
                     scope.launch {
-                        status = Pipeline.run(context)
+                        status = Pipeline.run(context, Trigger.MANUAL)
                         syncing = false
                     }
                 },
@@ -424,7 +437,13 @@ private fun SleepScreen(modifier: Modifier, tick: Int, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, onDisconnected: () -> Unit) {
+private fun SettingsScreen(
+    modifier: Modifier,
+    tick: Int,
+    onBack: () -> Unit,
+    onDisconnected: () -> Unit,
+    onLocalNetwork: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var confirm by remember { mutableStateOf(false) }
@@ -499,7 +518,7 @@ private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, on
 
         Spacer(Modifier.height(8.dp))
         Text("Sync with", style = MaterialTheme.typography.titleSmall)
-        listOf("server" to "Server", "direct" to "PC directly", "both" to "Both").forEach { (value, label) ->
+        listOf("server" to "Server", "direct" to "Laptop directly", "both" to "Both").forEach { (value, label) ->
             Row(
                 Modifier.fillMaxWidth().selectable(selected = mode == value, role = Role.RadioButton, onClick = {
                     prefs.syncMode = value
@@ -512,13 +531,12 @@ private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, on
                 Text(label)
             }
         }
-        if (!SyncEngine.usesServer(mode) || mode == "both") {
-            Text(
-                "Syncing directly with the PC isn't built yet, so " +
-                    if (mode == "both") "Both works like Server for now." else "this phone syncs nothing for now.",
-                style = MaterialTheme.typography.bodySmall,
-            )
+        if (mode != "server" && prefs.peer == null) {
+            Text("Pair with your laptop below to sync with it directly.", style = MaterialTheme.typography.bodySmall)
         }
+
+        Spacer(Modifier.height(8.dp))
+        LaptopSection(reload, onLocalNetwork) { reload++ }
 
         Spacer(Modifier.height(8.dp))
         Text("Backup", style = MaterialTheme.typography.titleSmall)
@@ -588,5 +606,320 @@ private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, on
             },
             dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
         )
+    }
+}
+
+
+/**
+ * Pairing with the laptop for direct sync: scan its QR code (the camera is asked for with an explanation
+ * first) or type the code by hand. The pairing secret, the key and the pinned certificate are kept in the
+ * encrypted preferences; "Remove pairing" deletes them.
+ */
+@Composable
+private fun LaptopSection(reload: Int, onLocalNetwork: () -> Unit, onChanged: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = Graph.prefs
+    val peer = remember(reload) { prefs.peer }
+    var message by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var explainCamera by remember { mutableStateOf(false) }
+    var cameraBlocked by remember { mutableStateOf(false) }
+    var manual by remember { mutableStateOf(false) }
+    var confirmRemove by remember { mutableStateOf(false) }
+
+    /** Saves a pairing code and asks the laptop for this phone's key right away. */
+    fun usePairing(pairing: PeerPairing) {
+        DirectTransport.savePairing(pairing)
+        val switched = when (prefs.syncMode) { // pairing means: sync with it
+            "server" -> if (prefs.connected) "both" else "direct"
+            else -> null
+        }
+        if (switched != null) prefs.syncMode = switched
+        onChanged()
+        busy = true
+        message = "Pairing with the laptop…"
+        scope.launch {
+            message = withContext(Dispatchers.IO) {
+                val result = try {
+                    synchronized(SyncEngine.lock) { DirectTransport(pairing, context).pair() }
+                    "Paired with ${prefs.peer?.name ?: "the laptop"}."
+                } catch (e: SyncException) {
+                    when {
+                        e is LaptopNotFoundException || e is NoWifiException ->
+                            "Saved, but the laptop couldn't be reached yet. ${e.message} Pairing finishes on the next sync " +
+                                "while the code is still valid (10 minutes)."
+                        else -> SyncStatus.problem("direct", e) // wrong code, wrong certificate, …
+                    }
+                }
+                result + when (switched) {
+                    "both" -> " Sync with is now Both."
+                    "direct" -> " Sync with is now Laptop directly."
+                    else -> ""
+                }
+            }
+            busy = false
+            onChanged()
+            Scheduler.syncNow(context)
+        }
+    }
+
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val text = result.contents ?: return@rememberLauncherForActivityResult // closed without scanning
+        try {
+            usePairing(PairingCode.parse(text))
+        } catch (e: PairingCodeException) {
+            message = e.message ?: "This isn't a Screen Time pairing code."
+        }
+    }
+
+    fun scan() {
+        scanner.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt("Scan the code from Pair a phone… in Screen Time on your laptop")
+                .setBeepEnabled(false)
+                .setOrientationLocked(false),
+        )
+    }
+
+    val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            scan()
+        } else {
+            val activity = context.findActivity()
+            // No rationale to show again means "don't ask again": only system settings can allow it now.
+            cameraBlocked = activity != null && !activity.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)
+            message = "Without the camera, enter the pairing code by hand."
+        }
+    }
+
+    Text("Laptop", style = MaterialTheme.typography.titleSmall)
+    val needsLocalNetwork = remember(reload) { LocalNetworkAccess.missing(context) }
+    if (needsLocalNetwork) {
+        HintCard(
+            "Allow local network access",
+            "Syncing with your laptop needs access to devices on your Wi-Fi.",
+            "Why and how",
+            onLocalNetwork,
+        )
+    }
+    if (peer != null) {
+        Text(
+            "Paired with \"${peer.name}\", " +
+                (peer.lastKnown?.let { "last found at $it." } ?: "at ${peer.addresses.joinToString(", ")} (port ${peer.port})."),
+        )
+        Text(
+            "Certificate ${peer.certSha256.take(16).chunked(2).joinToString(":").uppercase()}…" +
+                if (peer.key == null) " · Waiting for the laptop to confirm the pairing." else "",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    } else {
+        Text(
+            "Sync with your Windows laptop over your own network, without a server. On the laptop, open Screen Time, " +
+                "tick Allow phone sync and choose Pair a phone…, then scan the code it shows.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(enabled = !busy, onClick = {
+            message = ""
+            cameraBlocked = false
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                scan()
+            } else {
+                explainCamera = true // say why before Android asks
+            }
+        }) { Text(if (peer == null) "Pair with laptop" else "Pair again") }
+        OutlinedButton(enabled = !busy, onClick = { message = ""; manual = true }) { Text("Enter code") }
+    }
+    if (peer != null) {
+        OutlinedButton(enabled = !busy, onClick = { confirmRemove = true }) { Text("Remove pairing") }
+        // Step 4 of finding the laptop: tried after the last known address, a broadcast and the Wi-Fi gateway
+        var manualText by remember(reload) { mutableStateOf(peer.manual?.toString() ?: "") }
+        var manualError by remember { mutableStateOf("") }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                manualText, { manualText = it; manualError = "" }, Modifier.weight(1f),
+                label = { Text("Laptop's address, if it isn't found") },
+                placeholder = { Text("192.168.1.20") },
+                singleLine = true,
+            )
+            TextButton(onClick = {
+                if (manualText.isBlank()) {
+                    DirectTransport.setManualAddress(null)
+                    message = "Address cleared."
+                    onChanged()
+                } else {
+                    val endpoint = Endpoint.parse(manualText, peer.port)
+                    if (endpoint == null) {
+                        manualError = "Enter an IP address, e.g. 192.168.1.20 or 192.168.1.20:${peer.port}."
+                    } else {
+                        DirectTransport.setManualAddress(endpoint)
+                        message = "Saved. It's tried when the laptop isn't found otherwise."
+                        onChanged()
+                        Scheduler.syncNow(context)
+                    }
+                }
+            }) { Text("Save") }
+        }
+        if (manualError.isNotEmpty()) Text(manualError, color = MaterialTheme.colorScheme.error)
+        Text(
+            "The phone looks for the laptop at its last known address, then with a broadcast on your network, then at " +
+                "the Wi-Fi gateway (when the phone uses the laptop's hotspot), and last at this address.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+    if (message.isNotEmpty()) Text(message, style = MaterialTheme.typography.bodySmall)
+    if (cameraBlocked) {
+        OutlinedButton(onClick = {
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
+            )
+        }) { Text("Allow the camera in settings") }
+    }
+
+    if (explainCamera) {
+        AlertDialog(
+            onDismissRequest = { explainCamera = false },
+            title = { Text("Use the camera to scan the code?") },
+            text = {
+                Text(
+                    "Screen Time needs the camera to read the pairing QR code on your laptop's screen. It is only on " +
+                        "while the scanner is open; the code is read on this phone and no picture is saved or sent. " +
+                        "If you'd rather not, choose Enter code instead.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    explainCamera = false
+                    cameraPermission.launch(Manifest.permission.CAMERA)
+                }) { Text("Continue") }
+            },
+            dismissButton = { TextButton(onClick = { explainCamera = false }) { Text("Not now") } },
+        )
+    }
+
+    if (manual) {
+        var address by remember { mutableStateOf("") }
+        var port by remember { mutableStateOf(PairingCode.DEFAULT_PORT.toString()) }
+        var secret by remember { mutableStateOf("") }
+        var fingerprint by remember { mutableStateOf("") }
+        var error by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { manual = false },
+            title = { Text("Enter the pairing code") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Copy these from the laptop's pairing window.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(address, { address = it }, Modifier.fillMaxWidth(), label = { Text("Laptop's IP address") }, singleLine = true)
+                    OutlinedTextField(port, { port = it }, Modifier.fillMaxWidth(), label = { Text("Port") }, singleLine = true)
+                    OutlinedTextField(secret, { secret = it }, Modifier.fillMaxWidth(), label = { Text("Pairing secret") }, singleLine = true)
+                    OutlinedTextField(
+                        fingerprint, { fingerprint = it }, Modifier.fillMaxWidth(),
+                        label = { Text("Certificate fingerprint (SHA-256)") },
+                    )
+                    if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    try {
+                        val pairing = PairingCode.manual(address, port, secret, fingerprint)
+                        manual = false
+                        usePairing(pairing)
+                    } catch (e: PairingCodeException) {
+                        error = e.message ?: ""
+                    }
+                }) { Text("Pair") }
+            },
+            dismissButton = { TextButton(onClick = { manual = false }) { Text("Cancel") } },
+        )
+    }
+
+    if (confirmRemove && peer != null) {
+        AlertDialog(
+            onDismissRequest = { confirmRemove = false },
+            title = { Text("Remove the pairing?") },
+            text = {
+                Text(
+                    "This phone forgets \"${peer.name}\" and its key, and stops syncing with it. What was already " +
+                        "synced stays. To revoke this phone on the laptop too, choose Remove pairing there.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRemove = false
+                    DirectTransport.removePairing()
+                    if (prefs.syncMode != "server" && prefs.connected) prefs.syncMode = "server"
+                    message = "Pairing removed." + if (prefs.syncMode == "server") " Sync with is now Server." else ""
+                    onChanged()
+                }) { Text("Remove") }
+            },
+            dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+
+/**
+ * Why direct sync needs Android's local network permission, before Android asks. Only shown where the
+ * permission exists and applies: Android 17 and later, with the app targeting API 37 or later. Until then
+ * (this app targets 36) local network access comes with the internet permission and nothing is asked.
+ */
+@Composable
+private fun LocalNetworkScreen(modifier: Modifier, onDone: () -> Unit) {
+    val context = LocalContext.current
+    var message by remember { mutableStateOf("") }
+    val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            Scheduler.syncNow(context)
+            onDone()
+        } else {
+            message = "Not allowed. Without it the phone can still sync through your server; to sync with the laptop, " +
+                "allow Nearby devices for Screen Time in the system settings."
+        }
+    }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onDone) { Text("‹ Back") }
+            Text("Local network access", style = MaterialTheme.typography.headlineSmall)
+        }
+        Text(
+            "To sync with your laptop directly, Screen Time talks to it over your own Wi-Fi: it looks for the laptop " +
+                "with a short broadcast, then connects to it. Android asks for permission before an app may reach " +
+                "devices on your local network.",
+        )
+        Text("What it's used for", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "Only to find your paired laptop and exchange your screen time and sleep periods with it. The connection " +
+                "is encrypted and checked against the laptop's certificate from pairing. Nothing else on your network " +
+                "is contacted, and nothing goes to the internet this way.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text("If you don't allow it", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "Sync through your server keeps working. You can allow it later here or under Nearby devices in the " +
+                "system settings.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { request.launch(LocalNetwork.PERMISSION) }) { Text("Continue") }
+            OutlinedButton(onClick = onDone) { Text("Not now") }
+        }
+        if (message.isNotEmpty()) {
+            Text(message, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = {
+                context.startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
+                )
+            }) { Text("Open app settings") }
+        }
     }
 }
