@@ -677,7 +677,7 @@ private fun LaptopSection(reload: Int, onLocalNetwork: () -> Unit, onChanged: ()
         scanner.launch(
             ScanOptions()
                 .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                .setPrompt("Scan the code from Pair a phone… in Screen Time on your laptop")
+                .setPrompt("Scan the code from Pair phone in Screen Time on your laptop")
                 .setBeepEnabled(false)
                 .setOrientationLocked(false),
         )
@@ -717,7 +717,7 @@ private fun LaptopSection(reload: Int, onLocalNetwork: () -> Unit, onChanged: ()
     } else {
         Text(
             "Sync with your Windows laptop over your own network, without a server. On the laptop, open Screen Time, " +
-                "tick Allow phone sync and choose Pair a phone…, then scan the code it shows.",
+                "choose Pair phone in the Connect tab, then scan the code it shows.",
             style = MaterialTheme.typography.bodySmall,
         )
     }

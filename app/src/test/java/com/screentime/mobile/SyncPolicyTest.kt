@@ -35,7 +35,7 @@ class SyncPolicyTest {
     @Test
     fun laptopOff() {
         assertEquals(
-            "Laptop not found. Is it on, with Screen Time running and Allow phone sync ticked, on the same Wi-Fi? Will try again.",
+            "Laptop not found. Is it on, with Screen Time running and syncing with the phone, on the same Wi-Fi? Will try again.",
             status(direct(LaptopNotFoundException(), Trigger.MANUAL)),
         )
         assertEquals("opening the app says so too", status(direct(LaptopNotFoundException(), Trigger.MANUAL)),
@@ -113,7 +113,7 @@ class SyncPolicyTest {
     @Test
     fun bothWithTheLaptopOffInTheForeground() {
         assertEquals(
-            "Laptop: Laptop not found. Is it on, with Screen Time running and Allow phone sync ticked, on the same Wi-Fi? " +
+            "Laptop: Laptop not found. Is it on, with Screen Time running and syncing with the phone, on the same Wi-Fi? " +
                 "Will try again. Server: synced at 12:30.",
             status(direct(LaptopNotFoundException()), Outcome("server", 0, null)),
         )

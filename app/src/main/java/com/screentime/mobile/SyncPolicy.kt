@@ -16,7 +16,7 @@ class NoWifiException : SyncException("Not on Wi-Fi, so the laptop can't be reac
 
 /** Discovery found no laptop at any address. */
 class LaptopNotFoundException : SyncException(
-    "Laptop not found. Is it on, with Screen Time running and Allow phone sync ticked, on the same Wi-Fi? Will try again.",
+    "Laptop not found. Is it on, with Screen Time running and syncing with the phone, on the same Wi-Fi? Will try again.",
 )
 
 /** The laptop refused the proof (401). [pairing]: it was the pairing code's secret, else this phone's key. */

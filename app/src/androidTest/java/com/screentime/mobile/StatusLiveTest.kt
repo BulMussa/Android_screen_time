@@ -70,7 +70,7 @@ class StatusLiveTest {
         // isn't known), not at the gateway.
         val off = scratch.copy(port = scratch.port + 1, key = "k", secret = null)
         assertEquals(
-            "Laptop not found. Is it on, with Screen Time running and Allow phone sync ticked, on the same Wi-Fi? Will try again.",
+            "Laptop not found. Is it on, with Screen Time running and syncing with the phone, on the same Wi-Fi? Will try again.",
             statusOf { DirectTransport(off, context).send(emptyList(), emptyList()) },
         )
     }
