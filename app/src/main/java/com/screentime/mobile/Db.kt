@@ -301,6 +301,10 @@ class Db(context: Context, name: String = "screentime.db", private val onFresh: 
     @Synchronized
     fun allIntervals(): List<Interval> = query("1", emptyArray(), "ORDER BY start_ts")
 
+    /** This phone's app times of one local day (YYYY-MM-DD). */
+    @Synchronized
+    fun usageOn(day: String): List<Usage> = queryUsage("day = ?", arrayOf(day))
+
     @Synchronized
     fun allUsage(): List<Usage> = queryUsage("1", emptyArray(), "ORDER BY day, app")
 

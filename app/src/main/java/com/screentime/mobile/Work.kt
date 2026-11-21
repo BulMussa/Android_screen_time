@@ -31,8 +31,11 @@ object Pipeline {
     suspend fun run(context: Context, trigger: Trigger): String = withContext(Dispatchers.IO) {
         runCatching { UsageCollector.scan(context) }
         if (Graph.prefs.sleepMethod == "band") runCatching { SleepCollector.scan(context) }
-        val status = SyncStatus.text(SyncEngine.run(trigger), previous = Graph.prefs.status)
+        val outcomes = SyncEngine.run(trigger)
+        val status = SyncStatus.text(outcomes, previous = Graph.prefs.status)
         Graph.prefs.status = status
+        if (SyncStatus.synced(outcomes)) Graph.prefs.lastSyncedMs = nowMs()
+        Graph.prefs.syncProblem = SyncStatus.failure(outcomes, status, Graph.prefs.syncProblem)
         Reminders.check(context)
         status
     }

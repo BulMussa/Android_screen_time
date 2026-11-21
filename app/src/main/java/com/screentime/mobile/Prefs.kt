@@ -91,6 +91,20 @@ class Prefs(context: Context) : CursorStore {
         get() = plain.getString("sleep_method", null)
         set(value) = plain.edit().putString("sleep_method", value).apply()
 
+    /** When a sync last succeeded (epoch ms, 0 = never); the home screen's "Last synced at". Written at once. */
+    var lastSyncedMs: Long
+        get() = plain.getLong("last_synced_ms", 0L)
+        set(value) {
+            plain.edit().putLong("last_synced_ms", value).commit()
+        }
+
+    /** Why the last sync failed, shown under "Last synced at"; null when it worked. Written at once. */
+    var syncProblem: String?
+        get() = plain.getString("sync_problem", null)
+        set(value) {
+            plain.edit().putString("sync_problem", value).commit()
+        }
+
     /** The status line; written at once, so a background sync's result isn't lost when its process ends. */
     var status: String
         get() = plain.getString("status", "Not synced yet") ?: "Not synced yet"

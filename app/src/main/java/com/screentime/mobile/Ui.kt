@@ -14,6 +14,18 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -83,7 +95,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private enum class Screen { SETUP, HOME, SLEEP, SETTINGS, LOCAL_NETWORK }
+private enum class Screen { SETUP, HOME, SLEEP, SETTINGS, CONNECTION, PERMISSIONS, SLEEP_SETTINGS, BACKUP, LOCAL_NETWORK }
+
+private const val APP_SCAN_MS = 30_000L // how often the open home screen reads today's usage from Android
 
 @Composable
 fun AppRoot() {
@@ -96,20 +110,33 @@ fun AppRoot() {
             tick++
         }
     }
+    var localNetworkFrom by remember { mutableStateOf(Screen.CONNECTION) } // the page that opened Local network
     BackHandler(enabled = screen != Screen.HOME && screen != Screen.SETUP) {
-        screen = if (screen == Screen.LOCAL_NETWORK) Screen.SETTINGS else Screen.HOME
+        screen = when (screen) {
+            Screen.LOCAL_NETWORK -> localNetworkFrom
+            Screen.CONNECTION, Screen.PERMISSIONS, Screen.SLEEP_SETTINGS, Screen.BACKUP -> Screen.SETTINGS
+            else -> Screen.HOME
+        }
     }
     val page = Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp)
+    val toSettings = { screen = Screen.SETTINGS }
     when (screen) {
         Screen.SETUP -> SetupScreen(page, onDone = { screen = Screen.HOME })
-        Screen.HOME -> HomeScreen(page, tick, onSleep = { screen = Screen.SLEEP }, onSettings = { screen = Screen.SETTINGS })
+        Screen.HOME -> HomeScreen(page, tick, onSleep = { screen = Screen.SLEEP }, onSettings = toSettings)
         Screen.SLEEP -> SleepScreen(page, tick, onBack = { screen = Screen.HOME })
-        Screen.SETTINGS -> SettingsScreen(
-            page, tick, onBack = { screen = Screen.HOME },
-            onDisconnected = { screen = Screen.SETUP },
-            onLocalNetwork = { screen = Screen.LOCAL_NETWORK },
+        Screen.SETTINGS -> SettingsScreen(page, tick, onBack = { screen = Screen.HOME }, onOpen = { screen = it })
+        Screen.CONNECTION -> ConnectionScreen(
+            page, onBack = toSettings,
+            onConnect = { screen = Screen.SETUP },
+            onLocalNetwork = { localNetworkFrom = Screen.CONNECTION; screen = Screen.LOCAL_NETWORK },
         )
-        Screen.LOCAL_NETWORK -> LocalNetworkScreen(page, onDone = { screen = Screen.SETTINGS })
+        Screen.PERMISSIONS -> PermissionsScreen(
+            page, tick, onBack = toSettings,
+            onLocalNetwork = { localNetworkFrom = Screen.PERMISSIONS; screen = Screen.LOCAL_NETWORK },
+        )
+        Screen.SLEEP_SETTINGS -> SleepSettingsScreen(page, tick, onBack = toSettings)
+        Screen.BACKUP -> BackupScreen(page, onBack = toSettings)
+        Screen.LOCAL_NETWORK -> LocalNetworkScreen(page, onDone = { screen = localNetworkFrom })
     }
 }
 
@@ -177,13 +204,29 @@ private fun HomeScreen(modifier: Modifier, tick: Int, onSleep: () -> Unit, onSet
     val scope = rememberCoroutineScope()
     var day by remember { mutableStateOf(LocalDate.now()) }
     var info by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf(Graph.prefs.status) }
+    var status by remember { mutableStateOf(SyncStatus.lastSynced(Graph.prefs.lastSyncedMs)) }
+    var problem by remember { mutableStateOf(Graph.prefs.syncProblem) }
     var syncing by remember { mutableStateOf(false) }
     val rows = remember(day, tick) { Timelines.rows(day) }
     val today = LocalDate.now()
     val hasUsage = remember(tick) { UsageCollector.hasAccess(context) }
     val sleepMethod = remember(tick) { Graph.prefs.sleepMethod }
-    LaunchedEffect(tick) { if (!syncing) status = Graph.prefs.status }
+    var scanned by remember { mutableIntStateOf(0) }
+    val apps = remember(day, tick, scanned) { AppTimes.ranked(Graph.db.usageOn(day.toString()), Launchers.labels(context)) }
+    var lastScanMs by remember { mutableLongStateOf(0L) }
+    fun readStatus() {
+        status = SyncStatus.lastSynced(Graph.prefs.lastSyncedMs)
+        problem = Graph.prefs.syncProblem
+    }
+    LaunchedEffect(tick) { if (!syncing) readStatus() }
+    LaunchedEffect(tick, day) {
+        // Today's app times (and the phone bar) are read from Android while the screen is open, not only on syncs
+        if (day == today && hasUsage && nowMs() - lastScanMs >= APP_SCAN_MS) {
+            lastScanMs = nowMs()
+            withContext(Dispatchers.IO) { runCatching { UsageCollector.scan(context) } }
+            scanned++
+        }
+    }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -209,18 +252,25 @@ private fun HomeScreen(modifier: Modifier, tick: Int, onSleep: () -> Unit, onSet
         )
 
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            Column(Modifier.weight(1f)) {
+                Text(status, style = MaterialTheme.typography.bodySmall)
+                val why = problem
+                if (!syncing && why != null) {
+                    Text(why, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
             OutlinedButton(
                 enabled = !syncing,
                 onClick = {
                     syncing = true
                     status = "Syncing…"
                     scope.launch {
-                        status = Pipeline.run(context, Trigger.MANUAL)
+                        Pipeline.run(context, Trigger.MANUAL)
                         syncing = false
+                        readStatus()
                     }
                 },
-            ) { Text("Sync now") }
+            ) { Text("Sync") }
         }
 
         if (!hasUsage) {
@@ -246,7 +296,89 @@ private fun HomeScreen(modifier: Modifier, tick: Int, onSleep: () -> Unit, onSet
                 }
             }
         }
+
+        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+        Text("Most used apps", style = MaterialTheme.typography.titleMedium)
+        TopApps(apps.take(3))
+        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+        Text("Apps", style = MaterialTheme.typography.titleMedium)
+        AppList(apps)
     }
+}
+
+/** The top 3 apps side by side: rank, icon, name and time, like the Windows Report tab. */
+@Composable
+private fun TopApps(top: List<AppTime>) {
+    if (top.isEmpty()) {
+        NoData()
+        return
+    }
+    Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        for (i in 0 until 3) {
+            val app = top.getOrNull(i)
+            Column(Modifier.weight(1f)) {
+                if (app == null) return@Column
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${i + 1}", style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 8.dp),
+                    )
+                    AppIcon(app.app, 36.dp)
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(app.app, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    AppTimes.duration(app.seconds), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** Every app used on the day with its whole time and its share of all apps' time, most used first. */
+@Composable
+private fun AppList(apps: List<AppTime>) {
+    if (apps.isEmpty()) {
+        NoData()
+        return
+    }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("App", style = MaterialTheme.typography.labelMedium, color = muted, modifier = Modifier.weight(1f))
+        Text("Time", style = MaterialTheme.typography.labelMedium, color = muted)
+        Text("Share", style = MaterialTheme.typography.labelMedium, color = muted, textAlign = TextAlign.End, modifier = Modifier.width(56.dp))
+    }
+    apps.forEach { app ->
+        Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            AppIcon(app.app, 28.dp)
+            Text(
+                app.app, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+            )
+            Text(AppTimes.duration(app.seconds))
+            Text(AppTimes.percent(app.share), color = muted, textAlign = TextAlign.End, modifier = Modifier.width(56.dp))
+        }
+    }
+}
+
+@Composable
+private fun NoData() {
+    Text(
+        "No data", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+    )
+}
+
+/** The app's icon, loaded off the main thread; an empty space of the same size until then, or if it has none. */
+@Composable
+private fun AppIcon(label: String, size: Dp) {
+    val context = LocalContext.current
+    val icon by produceState<ImageBitmap?>(null, label) {
+        value = withContext(Dispatchers.IO) { runCatching { AppIcons.get(context, label) }.getOrNull() }
+    }
+    val bitmap = icon
+    if (bitmap == null) Spacer(Modifier.size(size)) else Image(bitmap, contentDescription = null, modifier = Modifier.size(size))
 }
 
 @Composable
@@ -369,10 +501,7 @@ private fun SleepScreen(modifier: Modifier, tick: Int, onBack: () -> Unit) {
     val clock = DateTimeFormatter.ofPattern("HH:mm")
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("‹ Back") }
-            Text("Sleep", style = MaterialTheme.typography.headlineSmall)
-        }
+        PageTitle("Sleep", onBack)
         Text("Add sleep by hand", style = MaterialTheme.typography.titleSmall)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Woke up on", modifier = Modifier.weight(1f))
@@ -432,32 +561,290 @@ private fun SleepScreen(modifier: Modifier, tick: Int, onBack: () -> Unit) {
     }
 }
 
+/** A page's top row: a back arrow and the title. */
 @Composable
-private fun SettingsScreen(
+private fun PageTitle(title: String, onBack: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onClick = onBack, modifier = Modifier.semantics { contentDescription = "Back" }) {
+            Text("‹", style = MaterialTheme.typography.headlineSmall)
+        }
+        Text(title, style = MaterialTheme.typography.headlineSmall)
+    }
+}
+
+/** The Settings menu: one entry per section, each opening its own page. */
+@Composable
+private fun SettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, onOpen: (Screen) -> Unit) {
+    val method = remember(tick) { Graph.prefs.sleepMethod }
+
+    Column(modifier) {
+        PageTitle("Settings", onBack)
+        Spacer(Modifier.height(8.dp))
+        SettingsEntry("Connection", "Sync methods and pairing") { onOpen(Screen.CONNECTION) }
+        HorizontalDivider()
+        SettingsEntry("Permissions", "Usage access, sleep data, notifications") { onOpen(Screen.PERMISSIONS) }
+        HorizontalDivider()
+        SettingsEntry(
+            "Sleep",
+            when (method) {
+                "band" -> "From a smartwatch or band (Health Connect)"
+                "manual" -> "Added by hand"
+                else -> "Not chosen yet"
+            },
+        ) { onOpen(Screen.SLEEP_SETTINGS) }
+        HorizontalDivider()
+        SettingsEntry("Backup", "Export or import everything as a JSON file") { onOpen(Screen.BACKUP) }
+    }
+}
+
+@Composable
+private fun SettingsEntry(title: String, summary: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(role = Role.Button, onClick = onClick).padding(vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Text("›", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun notificationsAllowed(context: Context): Boolean =
+    Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+/** Connection: how this phone syncs, the server, and the laptop. */
+@Composable
+private fun ConnectionScreen(
     modifier: Modifier,
-    tick: Int,
     onBack: () -> Unit,
-    onDisconnected: () -> Unit,
+    onConnect: () -> Unit,
     onLocalNetwork: () -> Unit,
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val prefs = Graph.prefs
     var confirm by remember { mutableStateOf(false) }
     var reload by remember { mutableIntStateOf(0) }
-    var healthMessage by remember { mutableStateOf("") }
-    val prefs = Graph.prefs
-    val hasUsage = remember(tick, reload) { UsageCollector.hasAccess(context) }
-    val method = remember(reload) { prefs.sleepMethod }
+    val mode = remember(reload) { prefs.syncMode }
 
-    val healthLauncher = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) { granted ->
-        healthMessage = if (granted.containsAll(SleepCollector.permissions)) "Sleep access allowed." else "Sleep access not allowed."
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PageTitle("Connection", onBack)
+
+        Text("Sync with", style = MaterialTheme.typography.titleSmall)
+        listOf("server" to "Server", "direct" to "Laptop directly", "both" to "Both").forEach { (value, label) ->
+            Row(
+                Modifier.fillMaxWidth().selectable(selected = mode == value, role = Role.RadioButton, onClick = {
+                    prefs.syncMode = value
+                    reload++
+                    Scheduler.syncNow(context)
+                }),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = mode == value, onClick = null) // the whole row is the button
+                Text(label)
+            }
+        }
+        if (mode != "server" && prefs.peer == null) {
+            Text("Pair with your laptop below to sync with it directly.", style = MaterialTheme.typography.bodySmall)
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Server", style = MaterialTheme.typography.titleSmall)
+        if (prefs.connected) {
+            Text("Connected to ${prefs.server} as \"${prefs.deviceName}\".")
+            Text(prefs.status, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = { confirm = true }) { Text("Disconnect") }
+        } else {
+            Text("Not connected. Phone use is still recorded on this phone.")
+            Button(onClick = onConnect) { Text("Connect") }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        LaptopSection(reload, onLocalNetwork) { reload++ }
+    }
+
+    if (confirm) {
+        AlertDialog(
+            onDismissRequest = { confirm = false },
+            title = { Text("Disconnect from the server?") },
+            text = { Text("What was already sent stays there, and this phone stops sending.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = false
+                    Api.disconnect()
+                    onConnect()
+                }) { Text("Disconnect") }
+            },
+            dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Permissions: what the app may use, whether it's allowed, and a way to allow it. */
+@Composable
+private fun PermissionsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit, onLocalNetwork: () -> Unit) {
+    val context = LocalContext.current
+    val hasUsage = remember(tick) { UsageCollector.hasAccess(context) }
+    val needsLocalNetwork = remember(tick) {
+        LocalNetwork.required(Build.VERSION.SDK_INT, context.applicationInfo.targetSdkVersion)
+    }
+    val localNetworkMissing = remember(tick) { LocalNetworkAccess.missing(context) }
+    val camera = remember(tick) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    }
+
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PageTitle("Permissions", onBack)
+
+        PermissionItem(
+            "Usage access", hasUsage,
+            "Needed to record when you use your phone and how long each app is open.",
+        ) {
+            OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }) {
+                Text("Open usage access settings")
+            }
+        }
+        HorizontalDivider()
+        SleepAccess(tick)
+        HorizontalDivider()
+        NotificationAccess(tick)
+        if (needsLocalNetwork) {
+            HorizontalDivider()
+            PermissionItem(
+                "Local network", !localNetworkMissing,
+                "Needed to find and sync with your laptop over your own Wi-Fi.",
+            ) {
+                if (localNetworkMissing) OutlinedButton(onClick = onLocalNetwork) { Text("Why and how") }
+            }
+        }
+        HorizontalDivider()
+        PermissionItem(
+            "Camera", camera,
+            "Only used to scan the laptop's pairing code, and asked for when you do.",
+        ) {}
+    }
+}
+
+@Composable
+private fun PermissionItem(title: String, allowed: Boolean?, text: String, action: @Composable () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            if (allowed != null) {
+                Text(
+                    if (allowed) "Allowed" else "Not allowed",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (allowed) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+        Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        action()
+    }
+}
+
+/** Health Connect sleep access: its state and the button that asks for it (on Permissions and Sleep). */
+@Composable
+private fun SleepAccess(tick: Int) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var reload by remember { mutableIntStateOf(0) }
+    var message by remember { mutableStateOf("") }
+    val allowed by produceState<Boolean?>(null, tick, reload) {
+        value = withContext(Dispatchers.IO) { runCatching { SleepCollector.hasPermission(context) }.getOrDefault(false) }
+    }
+    val launcher = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) { granted ->
+        message = if (granted.containsAll(SleepCollector.permissions)) "" else "Sleep access not allowed."
+        reload++
         scope.launch {
             withContext(Dispatchers.IO) { runCatching { SleepCollector.scan(context) } }
             Scheduler.syncNow(context)
         }
     }
-    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { reload++ }
-    val mode = remember(reload) { prefs.syncMode }
+    PermissionItem(
+        "Sleep data (Health Connect)", allowed,
+        "Needed when sleep comes from a smartwatch or band. Its app (for example Mi Fitness) must share sleep " +
+            "with Health Connect too.",
+    ) {
+        if (allowed == false) {
+            Button(onClick = {
+                if (!SleepCollector.available(context)) {
+                    message = "Health Connect isn't available. Install or update it from Google Play."
+                } else {
+                    message = ""
+                    launcher.launch(SleepCollector.permissions)
+                }
+            }) { Text("Allow sleep access") }
+        }
+        if (message.isNotEmpty()) Text(message, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/** Notifications, for the morning sleep reminder: their state and the button that asks for them. */
+@Composable
+private fun NotificationAccess(tick: Int) {
+    val context = LocalContext.current
+    var reload by remember { mutableIntStateOf(0) }
+    val allowed = remember(tick, reload) { notificationsAllowed(context) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { reload++ }
+    PermissionItem("Notifications", allowed, "Used for the morning reminder to add last night's sleep.") {
+        if (!allowed && Build.VERSION.SDK_INT >= 33) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { launcher.launch(Manifest.permission.POST_NOTIFICATIONS) }) { Text("Allow notifications") }
+                OutlinedButton(onClick = {
+                    context.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
+                    )
+                }) { Text("App settings") }
+            }
+        }
+    }
+}
+
+/** Sleep: where sleep comes from. */
+@Composable
+private fun SleepSettingsScreen(modifier: Modifier, tick: Int, onBack: () -> Unit) {
+    val prefs = Graph.prefs
+    var reload by remember { mutableIntStateOf(0) }
+    val method = remember(reload) { prefs.sleepMethod }
+
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        PageTitle("Sleep", onBack)
+        Text("Sleep comes from", style = MaterialTheme.typography.titleSmall)
+        listOf("band" to "Smartwatch or band (Health Connect)", "manual" to "Added by hand").forEach { (value, label) ->
+            Row(
+                Modifier.fillMaxWidth().selectable(selected = method == value, role = Role.RadioButton, onClick = {
+                    prefs.sleepMethod = value
+                    reload++
+                }),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = method == value, onClick = null) // the whole row is the button
+                Text(label)
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        when (method) {
+            "band" -> SleepAccess(tick)
+            "manual" -> {
+                Text(
+                    "Add sleep on the Sleep page. A reminder asks you each morning when notifications are allowed.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                NotificationAccess(tick)
+            }
+            else -> Text("Choose how you measure sleep.", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+/** Backup: export everything to a JSON file, or merge one in. */
+@Composable
+private fun BackupScreen(modifier: Modifier, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var backupMessage by remember { mutableStateOf("") }
     var backupBusy by remember { mutableStateOf(false) }
 
@@ -497,111 +884,19 @@ private fun SettingsScreen(
     }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("‹ Back") }
-            Text("Settings", style = MaterialTheme.typography.headlineSmall)
-        }
-
-        Text("Server", style = MaterialTheme.typography.titleSmall)
-        if (prefs.connected) {
-            Text("Connected to ${prefs.server} as \"${prefs.deviceName}\".")
-            Text(prefs.status, style = MaterialTheme.typography.bodySmall)
-            OutlinedButton(onClick = { confirm = true }) { Text("Disconnect") }
-        } else {
-            Text("Not connected. Phone use is still recorded on this phone.")
-            Button(onClick = onDisconnected) { Text("Connect") }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Text("Sync with", style = MaterialTheme.typography.titleSmall)
-        listOf("server" to "Server", "direct" to "Laptop directly", "both" to "Both").forEach { (value, label) ->
-            Row(
-                Modifier.fillMaxWidth().selectable(selected = mode == value, role = Role.RadioButton, onClick = {
-                    prefs.syncMode = value
-                    reload++
-                    Scheduler.syncNow(context)
-                }),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                RadioButton(selected = mode == value, onClick = null) // the whole row is the button
-                Text(label)
-            }
-        }
-        if (mode != "server" && prefs.peer == null) {
-            Text("Pair with your laptop below to sync with it directly.", style = MaterialTheme.typography.bodySmall)
-        }
-
-        Spacer(Modifier.height(8.dp))
-        LaptopSection(reload, onLocalNetwork) { reload++ }
-
-        Spacer(Modifier.height(8.dp))
-        Text("Backup", style = MaterialTheme.typography.titleSmall)
+        PageTitle("Backup", onBack)
         Text(
             "A JSON file with everything on this phone. Importing merges a backup in (also one from the Windows app); " +
                 "for each period the newer copy wins.",
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodyMedium,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(enabled = !backupBusy, onClick = { exportLauncher.launch(Backup.fileName()) }) { Text("Export backup") }
+            Button(enabled = !backupBusy, onClick = { exportLauncher.launch(Backup.fileName()) }) { Text("Export backup") }
             OutlinedButton(enabled = !backupBusy, onClick = {
                 importLauncher.launch(arrayOf("application/json", "application/octet-stream", "text/*"))
             }) { Text("Import backup") }
         }
         if (backupMessage.isNotEmpty()) Text(backupMessage, style = MaterialTheme.typography.bodySmall)
-
-        Spacer(Modifier.height(8.dp))
-        Text("Phone use", style = MaterialTheme.typography.titleSmall)
-        Text(if (hasUsage) "Usage access is on." else "Usage access is off, so phone use can't be recorded.")
-        OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }) {
-            Text("Open usage access settings")
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Text("Sleep", style = MaterialTheme.typography.titleSmall)
-        listOf("band" to "Smartwatch or band (Health Connect)", "manual" to "Manually").forEach { (value, label) ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                RadioButton(selected = method == value, onClick = { prefs.sleepMethod = value; reload++ })
-                Text(label)
-            }
-        }
-        if (method == "band") {
-            Text(
-                "Your band's app (for example Mi Fitness) must share sleep with Health Connect. " +
-                    "Check its settings under data sharing.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    if (!SleepCollector.available(context)) {
-                        healthMessage = "Health Connect isn't available. Install or update it from Google Play."
-                    } else {
-                        healthLauncher.launch(SleepCollector.permissions)
-                    }
-                }) { Text("Allow sleep access") }
-            }
-            if (healthMessage.isNotEmpty()) Text(healthMessage, style = MaterialTheme.typography.bodySmall)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            OutlinedButton(onClick = { notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS) }) {
-                Text("Allow sleep reminders")
-            }
-        }
-    }
-
-    if (confirm) {
-        AlertDialog(
-            onDismissRequest = { confirm = false },
-            title = { Text("Disconnect from the server?") },
-            text = { Text("What was already sent stays there, and this phone stops sending.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirm = false
-                    Api.disconnect()
-                    onDisconnected()
-                }) { Text("Disconnect") }
-            },
-            dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
-        )
     }
 }
 
@@ -883,10 +1178,7 @@ private fun LocalNetworkScreen(modifier: Modifier, onDone: () -> Unit) {
         }
     }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onDone) { Text("‹ Back") }
-            Text("Local network access", style = MaterialTheme.typography.headlineSmall)
-        }
+        PageTitle("Local network access", onDone)
         Text(
             "To sync with your laptop directly, Screen Time talks to it over your own Wi-Fi: it looks for the laptop " +
                 "with a short broadcast, then connects to it. Android asks for permission before an app may reach " +

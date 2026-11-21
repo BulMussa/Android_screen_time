@@ -1,6 +1,9 @@
 package com.screentime.mobile
 
+import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalTime
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 /*
@@ -115,6 +118,27 @@ object SyncStatus {
                 "$label: ${problem(o.transport, e)}"
             }
         }
+    }
+
+    /** Whether a transport synced, which moves the home screen's "Last synced at". */
+    fun synced(outcomes: List<Outcome>): Boolean = outcomes.any { it.error == null }
+
+    /**
+     * The problem shown under "Last synced at": null when a transport synced, the [status] line when every
+     * reported one failed, and [previous] when nothing was reported (a quiet background attempt).
+     */
+    fun failure(outcomes: List<Outcome>, status: String, previous: String?): String? = when {
+        synced(outcomes) -> null
+        outcomes.any { !it.quiet } -> status
+        else -> previous
+    }
+
+    /** "Last synced at 14:29", with the date when it wasn't today. */
+    fun lastSynced(epochMs: Long, zone: ZoneId = ZoneId.systemDefault(), today: LocalDate = LocalDate.now(zone)): String {
+        if (epochMs <= 0) return "Not synced yet"
+        val at = Instant.ofEpochMilli(epochMs).atZone(zone)
+        val pattern = if (at.toLocalDate() == today) "HH:mm" else "d MMM, HH:mm"
+        return "Last synced at ${at.format(DateTimeFormatter.ofPattern(pattern))}"
     }
 
     fun problem(transport: String, e: SyncException): String {
