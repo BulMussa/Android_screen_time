@@ -315,11 +315,7 @@ private fun TimelineView(rows: List<TimelineRow>, showNow: Boolean, onInfo: (Str
                                     part.spans.firstOrNull { second >= it.start - slack && second <= it.end + slack }
                                         ?.let { part to it }
                                 }
-                                onInfo(
-                                    if (hit == null) "" else
-                                        "${hit.first.title}   ${hm(hit.second.start)} – ${hm(hit.second.end)}   " +
-                                            "(${short(hit.second.end - hit.second.start)})",
-                                )
+                                onInfo(if (hit == null) "" else Timelines.info(hit.first.title, hit.second))
                             }
                         },
                 ) {

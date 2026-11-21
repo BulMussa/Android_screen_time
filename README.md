@@ -1,6 +1,6 @@
 # Screen Time for Android
 
-The phone side of Screen Time. It records when you use your phone, reads sleep from Health Connect (or lets you add it by hand), and syncs with your own Screen Time server. Everything can also be exported to a backup file and imported again. One window shows three 24-hour timelines for a chosen day: laptop, phone and sleep. The laptop row comes from the Windows app, through the server or straight from the laptop over your own network (see [Sync modes](#sync-modes)).
+The phone side of Screen Time. It records when you use your phone, reads sleep from Health Connect (or lets you add it by hand), and syncs with your own Screen Time server. Everything can also be exported to a backup file and imported again. One window shows three 24-hour timelines for a chosen day: laptop, phone and sleep. The sleep bar is cut to the day, but the total under "Sleep" counts whole sessions by the day they end on: a night from 22:00 to 06:00 counts 8 h on the day it ends, and tonight's sleep shows on the right of the bar but counts on the next day. Sleep periods less than 90 minutes apart are one session, and tapping a sleep period shows its whole session (e.g. "22:00 (yesterday) – 06:00"). The laptop row comes from the Windows app, through the server or straight from the laptop over your own network (see [Sync modes](#sync-modes)).
 
 Everything stays between this phone, your server and your laptop; nothing goes anywhere else.
 
@@ -58,7 +58,7 @@ app/src/main/java/com/screentime/mobile/
   ScreenTimeApp.kt   starts the background job
   MainActivity.kt    the window; reads and syncs when opened
   Ui.kt              screens: setup, timelines, sleep, settings
-  Timeline.kt        builds the three rows for a day from the database
+  Timeline.kt        builds the three rows for a day from the database, with whole sleep sessions
   Collectors.kt      phone use (usage statistics) and sleep (Health Connect)
   SyncEngine.kt      sync mode and when each transport runs
   SyncCore.kt        push and pull over a transport, the merge rule (no Android classes)
@@ -83,6 +83,7 @@ app/src/test/java/com/screentime/mobile/
   BothModeTest.kt    "both" with a fake server and a fake laptop: overlapping and conflicting rows,
                      cursors, one route down, timelines
   SyncPolicyTest.kt  unit tests for SyncPolicy.kt: every status text, when the background tries, the backoff
+  TimelineTest.kt    unit tests for the Sleep row: sessions across midnight, short wake-ups, naps, the tap text
 app/src/androidTest/java/com/screentime/mobile/
   DiscoveryLiveTest.kt  the real sources against a real laptop; skipped unless it's named (see the file)
   BothModeDbTest.kt     "both" against the real SQLite database (throwaway files)
